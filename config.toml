@@ -1,0 +1,34 @@
+# X Communities Data Fetcher Configuration
+
+[data]
+# Number of days to go back for fetching posts
+days_back = 730
+
+# Number of days to go back for community interactions analysis
+days_back_communities = 365
+
+# Maximum posts per community (0 = unlimited)
+post_limit = 10000
+
+[communities]
+# List of community IDs to fetch from
+ids = [
+    "1917017448341246418",
+    # Add more community IDs here
+]
+
+[output]
+# Directory for raw data output
+raw_data_dir = "./raw"
+
+# File naming (using fixed name)
+
+[rate_limiting]
+# Maximum requests per second (Twitter API limit: 10)
+requests_per_second = 10
+
+# Delay between requests (seconds) - calculated as 1/requests_per_second
+request_delay = 0.1
+
+# Delay between communities (seconds)
+community_delay = 2.0
