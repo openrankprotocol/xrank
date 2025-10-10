@@ -2,10 +2,7 @@
 
 [data]
 # Number of days to go back for fetching posts
-days_back = 730
-
-# Number of days to go back for community interactions analysis
-days_back_communities = 365
+days_back = 365
 
 # Maximum posts per community (0 = unlimited)
 post_limit = 10000
