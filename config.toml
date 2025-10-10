@@ -32,3 +32,10 @@ request_delay = 0.1
 
 # Delay between communities (seconds)
 community_delay = 2.0
+
+[trust_weights]
+# Trust weights for different interaction types
+mention = 30
+reply = 20
+retweet = 50
+quote = 40
