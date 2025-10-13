@@ -7,6 +7,12 @@ days_back = 365
 # Maximum posts per community (0 = unlimited)
 post_limit = 10000
 
+# Maximum extended members to keep (ranked by following_count)
+extended_members_limit = 10000
+
+# Maximum following IDs to fetch per user
+max_following_per_user = 1000
+
 [communities]
 # List of community IDs to fetch from
 ids = [
@@ -32,6 +38,7 @@ community_delay = 2.0
 
 [trust_weights]
 # Trust weights for different interaction types
+follow = 30
 mention = 30
 reply = 20
 retweet = 50

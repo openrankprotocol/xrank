@@ -5,11 +5,12 @@ Non-Member Interactions Fetcher
 This script fetches interactions from non-members directed toward the community by:
 1. Loading raw/[community_id]_members.json and raw/[community_id]_non_members.json
 2. Creating a master list from these 2 lists
-3. Going through all non-members and finding posts that:
+3. Selecting top 1000 non-members based on total interaction counts for efficiency
+4. Going through selected non-members and finding posts that:
    - Mention a user from master list (@username)
    - Are retweets/quotes of posts made by someone from master list
-4. Going through all replies of non-members and keeping only replies that reply to posts made by someone from master list
-5. Saving to raw/[community_id]_non_member_interactions.json
+5. Going through all replies of selected non-members and keeping only replies that reply to posts made by someone from master list
+6. Saving to raw/[community_id]_non_member_interactions.json
 
 Uses endpoints:
 - /user-tweets for non-member timeline posts
@@ -264,8 +265,25 @@ def load_members_and_non_members(community_id, raw_data_dir):
                     'type': 'moderator'
                 })
 
+        # Sort non-members by total interactions (descending) and take top 1000
+        all_non_members = non_members_data.get('non_members', [])
+        top_non_members = sorted(
+            all_non_members,
+            key=lambda x: x.get('interaction_counts', {}).get('total', 0),
+            reverse=True
+        )[:1000]
+
+        print(f"Non-members prioritization:")
+        print(f"- Total non-members found: {len(all_non_members)}")
+        print(f"- Processing top: {len(top_non_members)}")
+
+        if top_non_members:
+            highest = top_non_members[0].get('interaction_counts', {}).get('total', 0)
+            lowest = top_non_members[-1].get('interaction_counts', {}).get('total', 0)
+            print(f"- Interaction count range: {highest} (highest) to {lowest} (lowest)")
+
         # Add non-members to master list (these are users that members interact with)
-        for non_member in non_members_data.get('non_members', []):
+        for non_member in top_non_members:
             if non_member.get('user_id') or non_member.get('username'):
                 if non_member.get('user_id'):
                     master_list['user_ids'].add(non_member['user_id'])
@@ -281,10 +299,10 @@ def load_members_and_non_members(community_id, raw_data_dir):
 
         print(f"Master list created:")
         print(f"- Members: {len(master_list['members'])}")
-        print(f"- Non-members: {len(master_list['non_members'])}")
+        print(f"- Non-members (top 1000): {len(master_list['non_members'])}")
         print(f"- Total unique users: {len(master_list['user_ids'])}")
 
-        return master_list, non_members_data.get('non_members', [])
+        return master_list, top_non_members
 
     except Exception as e:
         print(f"Error loading files: {e}")
@@ -709,6 +727,16 @@ def main():
                 print(f"No non-members found for community {community_id}")
                 continue
 
+            # Show top non-members info
+            if len(non_members) > 0:
+                print(f"\nTop non-members by interaction count:")
+                for i, nm in enumerate(non_members[:10], 1):
+                    username = nm.get('username', 'Unknown')
+                    total = nm.get('interaction_counts', {}).get('total', 0)
+                    print(f"  {i:2d}. @{username} ({total} interactions)")
+                if len(non_members) > 10:
+                    print(f"  ... and {len(non_members) - 10} more")
+
             # Load checkpoint if exists
             processed_non_members = load_checkpoint(community_id, raw_data_dir)
             processed_usernames = get_processed_usernames(processed_non_members)
@@ -716,7 +744,7 @@ def main():
             # Filter out already processed non-members
             remaining_non_members = [nm for nm in non_members if nm.get('username', '').lower() not in processed_usernames]
 
-            print(f"Total non-members: {len(non_members)}")
+            print(f"Total non-members (top 1000): {len(non_members)}")
             print(f"Already processed: {len(processed_non_members)}")
             print(f"Remaining to process: {len(remaining_non_members)}")
 
@@ -768,6 +796,7 @@ def main():
             print(f"NON-MEMBER INTERACTIONS FETCH COMPLETE")
             print(f"{'='*60}")
             print(f"Communities processed: {len(community_ids)}")
+            print(f"Optimization: Only top 1000 non-members processed per community")
             print(f"API Usage Summary:")
             print(f"- Total requests: {request_count}")
             print(f"- Total time: {total_time:.1f} seconds")
