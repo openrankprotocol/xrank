@@ -503,7 +503,7 @@ def analyze_following_network(master_list):
 
     # Create lookup dictionaries for efficient searching
     user_id_to_username = {user['user_id']: user['username'] for user in master_list if user.get('user_id')}
-    username_to_user_id = {user['username']: user['user_id'] for user in master_list if user.get('username')}
+    username_to_user_id = {user['username'].lower(): user['user_id'] for user in master_list if user.get('username')}
     master_user_ids = set(user_id_to_username.keys())
 
     following_network = []

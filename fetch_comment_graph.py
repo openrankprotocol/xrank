@@ -812,8 +812,14 @@ def build_comment_graph(posts, user_id_lookup, days_back):
                 commenter_id = comment.get('commenter_user_id')
                 commenter_username = comment.get('commenter_username', '')
 
+                # Check if commenter is in master list by user_id or username (case-insensitive)
+                commenter_info = None
                 if commenter_id and commenter_id in user_id_lookup:
                     commenter_info = user_id_lookup[commenter_id]
+                elif commenter_username and commenter_username.lower() in username_lookup:
+                    commenter_info = username_lookup[commenter_username.lower()]
+
+                if commenter_info:
                     comments_in_master_list += 1
 
                     # Create comment graph entry

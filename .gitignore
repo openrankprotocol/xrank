@@ -3,6 +3,7 @@ trust/**
 scores/**
 raw/**
 tmp/**
-__pycache__
+output/**
+__pycache__/**
 
 .env
