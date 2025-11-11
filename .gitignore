@@ -3,6 +3,7 @@ scores/**
 raw/**
 tmp/**
 output/**
+ui/**
 __pycache__/**
 
 .env

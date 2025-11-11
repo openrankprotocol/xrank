@@ -1,288 +1,330 @@
 #!/usr/bin/env python3
 """
-Score Filter and Normalizer
+Score Processing Script
 
-This script processes score files from scores/ directory and creates filtered/normalized versions:
-1. Loads scores from scores/[community_id].csv
-2. Creates normalized version (0-100k scale) removing zero scores
-3. Creates filtered version keeping only members and moderators from raw/[community_id]_members.json
-4. Saves both versions to output/ directory
+This script processes score files from the scores/ directory by:
+1. Loading all CSV score files
+2. Treating all peers as Discord users (usernames only)
+3. Applying transformations to make exponential distributions more linear
+4. Normalizing scores so all scores sum to 1
+5. Saving results to output/ directory with transformation suffixes
 
-Output files:
-- output/[community_id]_normalized.csv - All scores normalized 0-100k, zero scores removed
-- output/[community_id]_members_and_mods.csv - Members and moderators, normalized 0-100k, zero scores removed
+Transformations available:
+- Logarithmic (default): log transformation (first scaled to 1-100 range) to linearize exponential data
+- Square root: sqrt transformation
+- Quantile: quantile-based uniform distribution transformation
+
+Usage:
+    python3 process_scores.py              # Log transformation only (default)
+    python3 process_scores.py --sqrt       # Sqrt transformation only
+    python3 process_scores.py --quantile   # Quantile transformation only
+    python3 process_scores.py --sqrt --quantile  # Both sqrt and quantile transformations
+    python3 process_scores.py --members-only     # Filter to only community members
+
+Requirements:
+    - pandas (install with: pip install pandas)
+    - numpy (install with: pip install numpy)
+    - scipy (for quantile transformation)
+    - CSV files in scores/ directory with columns 'i' (identifier) and 'v' (score)
+
+Output:
+    - Creates output/ directory if it doesn't exist
+    - For each input file (e.g., ai.csv), creates:
+      - {filename}_users_log.csv: Users with logarithmic transformation (default, if no flags)
+      - {filename}_users_sqrt.csv: Users with sqrt transformation (if --sqrt flag is used)
+      - {filename}_users_quantile.csv: Users with quantile transformation (if --quantile flag is used)
+    - Scores are normalized and mapped to 0-1000 range, sorted by score (descending)
 """
 
+import argparse
 import json
 import os
-import toml
-import csv
+import re
+from pathlib import Path
 
-def load_config():
-    """Load configuration from config.toml"""
-    try:
-        with open('config.toml', 'r') as f:
-            config = toml.load(f)
-            print("✓ Configuration loaded successfully")
-            return config
-    except FileNotFoundError:
-        print("❌ Error: config.toml not found")
-        return None
-    except Exception as e:
-        print(f"❌ Error loading config: {e}")
-        return None
-
-def load_scores(scores_file):
-    """Load scores from CSV file"""
-    scores = {}
-
-    if not os.path.exists(scores_file):
-        print(f"⚠️  Scores file not found: {scores_file}")
-        return scores
-
-    try:
-        with open(scores_file, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                username = row.get('i', '').strip()
-                score_str = row.get('v', '').strip()
-                if username and score_str:
-                    try:
-                        score = float(score_str)
-                        scores[username.lower()] = score
-                    except ValueError:
-                        continue
-
-        print(f"✓ Loaded {len(scores)} scores from {os.path.basename(scores_file)}")
-        return scores
-    except Exception as e:
-        print(f"❌ Error loading scores from {scores_file}: {e}")
-        return {}
+import numpy as np
+import pandas as pd
+from scipy import stats
 
 
+def apply_sqrt_transformation(df):
+    """Apply square root transformation to scores"""
+    if len(df) == 0:
+        return df
 
-def load_members_and_mods_list(members_file):
-    """Load both member and moderator usernames from JSON file"""
-    members_and_mods_set = set()
+    df_transformed = df.copy()
+
+    # Apply sqrt transformation
+    df_transformed["v"] = np.sqrt(df["v"])
+
+    # Normalize to 0-1 range
+    min_val = df_transformed["v"].min()
+    max_val = df_transformed["v"].max()
+    if max_val != min_val:
+        df_transformed["v"] = (df_transformed["v"] - min_val) / (max_val - min_val)
+    else:
+        df_transformed["v"] = 1.0 / len(df)
+
+    # Map to 100-1000 range
+    df_transformed["v"] = df_transformed["v"] * 1000
+
+    # Round to 2 decimal places
+    df_transformed["v"] = df_transformed["v"].round(2)
+
+    return df_transformed
+
+
+def apply_log_transformation(df):
+    """Apply logarithmic transformation to scores (first scale to 1-100, then log)"""
+    if len(df) == 0:
+        return df
+
+    df_transformed = df.copy()
+
+    # First normalize to 0-1 range
+    min_val = df["v"].min()
+    max_val = df["v"].max()
+    if max_val != min_val:
+        df_transformed["v"] = (df["v"] - min_val) / (max_val - min_val)
+    else:
+        df_transformed["v"] = 1.0 / len(df)
+
+    # Map to 1-100 range
+    df_transformed["v"] = df_transformed["v"] * 99 + 1
+
+    # Apply log transformation
+    df_transformed["v"] = np.log(df_transformed["v"])
+
+    # Normalize back to 0-1 range
+    min_log = df_transformed["v"].min()
+    max_log = df_transformed["v"].max()
+    if max_log != min_log:
+        df_transformed["v"] = (df_transformed["v"] - min_log) / (max_log - min_log)
+    else:
+        df_transformed["v"] = 1.0 / len(df)
+
+    # Map to 100-1000 range
+    df_transformed["v"] = df_transformed["v"] * 1000
+
+    # Round to 2 decimal places
+    df_transformed["v"] = df_transformed["v"].round(2)
+
+    return df_transformed
+
+
+def apply_quantile_transformation(df):
+    """Apply quantile-based uniform distribution transformation"""
+    if len(df) == 0:
+        return df
+
+    df_transformed = df.copy()
+
+    # Use scipy for quantile transformation
+    df_transformed["v"] = stats.rankdata(df["v"]) / len(df["v"])
+
+    # Map to 100-1000 range
+    df_transformed["v"] = df_transformed["v"] * 1000
+
+    # Round to 2 decimal places
+    df_transformed["v"] = df_transformed["v"].round(2)
+
+    return df_transformed
+
+
+def load_community_members(community_id, raw_dir="raw"):
+    """
+    Load community members from raw/[community_id]_members.json
+
+    Args:
+        community_id (str): Community ID
+        raw_dir (str): Directory containing raw data files
+
+    Returns:
+        set: Set of usernames who are community members
+    """
+    members_file = os.path.join(raw_dir, f"{community_id}_members.json")
 
     if not os.path.exists(members_file):
-        print(f"⚠️  Members file not found: {members_file}")
-        return members_and_mods_set
-
-    try:
-        with open(members_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        # Load members
-        if 'members' in data:
-            for member in data['members']:
-                username = member.get('username', '').strip().lower()
-                if username:
-                    members_and_mods_set.add(username)
-
-        # Load moderators
-        if 'moderators' in data:
-            for moderator in data['moderators']:
-                username = moderator.get('username', '').strip().lower()
-                if username:
-                    members_and_mods_set.add(username)
-
-        print(f"✓ Loaded {len(members_and_mods_set)} members and moderators from {os.path.basename(members_file)}")
-        return members_and_mods_set
-
-    except Exception as e:
-        print(f"❌ Error loading members and moderators from {members_file}: {e}")
+        print(f"    Warning: Members file not found: {members_file}")
         return set()
 
-def normalize_scores(scores, target_max=100000):
-    """Normalize scores to 0-target_max range, removing zero scores"""
-    if not scores:
-        return {}
-
-    # Remove zero scores first
-    non_zero_scores = {k: v for k, v in scores.items() if v > 0}
-
-    if not non_zero_scores:
-        print("⚠️  No non-zero scores found")
-        return {}
-
-    # Find min and max values
-    min_score = min(non_zero_scores.values())
-    max_score = max(non_zero_scores.values())
-
-    print(f"  Original score range: {min_score:.6f} - {max_score:.6f}")
-
-    # Handle edge case where all scores are the same
-    if max_score == min_score:
-        normalized = {k: target_max for k in non_zero_scores.keys()}
-    else:
-        # Normalize to 0-target_max range
-        normalized = {}
-        for username, score in non_zero_scores.items():
-            normalized_score = ((score - min_score) / (max_score - min_score)) * target_max
-            # Round to nearest integer and ensure minimum of 1 (no zeros after normalization)
-            normalized_score = max(1, round(normalized_score))
-            normalized[username] = normalized_score
-
-    # Remove any that ended up as 0 after normalization (shouldn't happen but be safe)
-    final_normalized = {k: v for k, v in normalized.items() if v > 0}
-
-    print(f"  Normalized {len(final_normalized)} scores to range 1-{target_max}")
-
-    return final_normalized
-
-def save_scores_csv(scores, output_file):
-    """Save scores to CSV file with header i,v"""
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-    # Sort by score descending for consistent output
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-    with open(output_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['i', 'v'])
-
-        for username, score in sorted_scores:
-            writer.writerow([username, score])
-
-    print(f"✅ Saved {len(sorted_scores)} scores to {output_file}")
-
-    # Show statistics
-    if sorted_scores:
-        values = [score for _, score in sorted_scores]
-        min_score = min(values)
-        max_score = max(values)
-        avg_score = sum(values) / len(values)
-
-        print(f"  📊 Score statistics:")
-        print(f"    - Min: {min_score}")
-        print(f"    - Max: {max_score}")
-        print(f"    - Average: {avg_score:.1f}")
-
-    return output_file
-
-def filter_by_members(scores, members_set):
-    """Filter scores to keep only members"""
-    if not members_set:
-        return scores
-
-    filtered_scores = {k: v for k, v in scores.items() if k in members_set}
-
-    print(f"  Filtered to {len(filtered_scores)} member scores (from {len(scores)} total)")
-
-    return filtered_scores
-
-def process_community(community_id, scores_dir, raw_data_dir, output_dir):
-    """Process scores for a single community"""
-    print(f"\n{'='*60}")
-    print(f"Processing community: {community_id}")
-    print(f"{'='*60}")
-
-    # Define file paths
-    scores_file = os.path.join(scores_dir, f"{community_id}.csv")
-    members_file = os.path.join(raw_data_dir, f"{community_id}_members.json")
-
-    # Load data
-    scores = load_scores(scores_file)
-    if not scores:
-        print(f"❌ No scores found for community {community_id}")
-        return None
-
-    members_and_mods_set = load_members_and_mods_list(members_file)
-
-    print(f"🔄 Processing scores...")
-
-    # Create normalized version (all scores, normalized, zero scores removed)
-    print("  Creating normalized version...")
-    normalized_scores = normalize_scores(scores)
-
-    if normalized_scores:
-        normalized_file = os.path.join(output_dir, f"{community_id}_normalized.csv")
-        save_scores_csv(normalized_scores, normalized_file)
-    else:
-        print("  ❌ Failed to create normalized scores")
-
-    # Create members and moderators filtered version
-    print("  Creating members and moderators filtered version...")
-    members_and_mods_filtered_scores = filter_by_members(scores, members_and_mods_set)
-
-    if members_and_mods_filtered_scores:
-        members_and_mods_normalized = normalize_scores(members_and_mods_filtered_scores)
-
-        if members_and_mods_normalized:
-            members_and_mods_file = os.path.join(output_dir, f"{community_id}_members_and_mods.csv")
-            save_scores_csv(members_and_mods_normalized, members_and_mods_file)
-        else:
-            print("  ❌ Failed to normalize members and moderators scores")
-    else:
-        print("  ⚠️  No member/moderator scores found to filter")
-
-    return True
-
-def main():
-    """Main function to process score filtering and normalization"""
     try:
-        print("📊 SCORE FILTER AND NORMALIZER")
-        print("=" * 50)
+        with open(members_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-        # Load configuration
-        config = load_config()
-        if not config:
-            return
+        # Extract usernames from members list
+        members = data.get("members", [])
+        usernames = {member["username"] for member in members if "username" in member}
 
-        # Get configuration values
-        community_ids = config['communities']['ids']
-        raw_data_dir = config['output']['raw_data_dir']
-
-        # Define directories
-        scores_dir = './scores'
-        output_dir = './output'
-
-        print(f"📁 Scores directory: {scores_dir}")
-        print(f"📁 Raw data directory: {raw_data_dir}")
-        print(f"📁 Output directory: {output_dir}")
-        print(f"🏘️  Communities to process: {len(community_ids)}")
-
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Process each community
-        processed_communities = 0
-        for i, community_id in enumerate(community_ids):
-            try:
-                result = process_community(community_id, scores_dir, raw_data_dir, output_dir)
-                if result:
-                    processed_communities += 1
-            except Exception as e:
-                print(f"❌ Error processing community {community_id}: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # Final summary
-        print(f"\n{'='*60}")
-        print(f"🎉 SCORE PROCESSING COMPLETE")
-        print(f"{'='*60}")
-        print(f"✅ Successfully processed: {processed_communities}/{len(community_ids)} communities")
-        print(f"📁 Filtered scores saved in: {output_dir}/")
-
-        # List generated files
-        if os.path.exists(output_dir):
-            csv_files = [f for f in os.listdir(output_dir) if f.endswith('.csv')]
-            if csv_files:
-                print(f"📄 Generated files:")
-                for csv_file in sorted(csv_files):
-                    file_path = os.path.join(output_dir, csv_file)
-                    if os.path.exists(file_path):
-                        with open(file_path, 'r') as f:
-                            line_count = sum(1 for _ in f) - 1  # Subtract header
-                        print(f"  - {csv_file} ({line_count} scores)")
-            else:
-                print("⚠️  No output files generated")
+        print(f"    Loaded {len(usernames)} community members from {members_file}")
+        return usernames
 
     except Exception as e:
-        print(f"❌ Fatal error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        print(f"    Error loading members file: {e}")
+        return set()
+
+
+def process_scores(
+    input_file,
+    output_dir,
+    include_sqrt=False,
+    include_quantile=False,
+    members_only=False,
+):
+    """
+    Process a single score file by applying transformations and saving
+
+    Args:
+        input_file (str): Path to input CSV file
+        output_dir (str): Directory to save processed files
+        include_sqrt (bool): Whether to include sqrt transformation
+        include_quantile (bool): Whether to include quantile transformation
+        members_only (bool): Whether to filter to only community members
+    """
+    # Load the CSV file
+    df = pd.read_csv(input_file)
+
+    # Filter to community members if requested
+    if members_only:
+        community_id = Path(input_file).stem
+        member_usernames = load_community_members(community_id)
+
+        if member_usernames:
+            original_count = len(df)
+            df = df[df["i"].isin(member_usernames)]
+            filtered_count = len(df)
+            print(f"    Filtered to members: {filtered_count}/{original_count} users")
+
+            # Normalize scores to sum to 1.0 after filtering
+            if len(df) > 0:
+                score_sum = df["v"].sum()
+                if score_sum > 0:
+                    df["v"] = df["v"] / score_sum
+                    print(
+                        f"    Normalized scores to sum to 1.0 (sum before: {score_sum:.6f})"
+                    )
+                else:
+                    # If all scores are 0, assign equal weight
+                    df["v"] = 1.0 / len(df)
+                    print(
+                        f"    All scores were 0, assigned equal weight: {df['v'].iloc[0]:.6f}"
+                    )
+
+    # Build transformations dict based on flags
+    transformations = {}
+
+    # If no flags are passed, default to log transformation
+    if not include_sqrt and not include_quantile:
+        transformations["log"] = apply_log_transformation
+    else:
+        # Use only the specified transformations
+        if include_sqrt:
+            transformations["sqrt"] = apply_sqrt_transformation
+
+        if include_quantile:
+            transformations["quantile"] = apply_quantile_transformation
+
+    base_name = Path(input_file).stem
+    print(f"Processing {input_file}:")
+
+    for transform_name, transform_func in transformations.items():
+        # Apply transformation to all users
+        users_transformed = transform_func(df.copy())
+
+        # Sort by score (descending)
+        users_transformed = users_transformed.sort_values("v", ascending=False)
+
+        # Generate output file name
+        users_output = os.path.join(
+            output_dir, f"{base_name}_users_{transform_name}.csv"
+        )
+
+        # Save the processed file
+        users_transformed.to_csv(users_output, index=False)
+
+        # Show score ranges
+        users_min = users_transformed["v"].min() if len(users_transformed) > 0 else 0
+        users_max = users_transformed["v"].max() if len(users_transformed) > 0 else 0
+
+        print(f"  - {transform_name.capitalize()} transformation:")
+        print(f"    Users: {len(users_transformed)} entries -> {users_output}")
+        print(f"    Score range: {users_min:.2f} - {users_max:.2f}")
+
+
+def main():
+    """
+    Main function to process all score files
+    """
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Process score files with transformations. Log transformation is applied by default when no flags are specified."
+    )
+    parser.add_argument(
+        "--sqrt",
+        action="store_true",
+        help="Use square root transformation (replaces default log)",
+    )
+    parser.add_argument(
+        "--quantile",
+        action="store_true",
+        help="Use quantile transformation (replaces default log)",
+    )
+    parser.add_argument(
+        "--members-only",
+        action="store_true",
+        help="Filter scores to only include community members from raw/[community_id]_members.json",
+    )
+    args = parser.parse_args()
+
+    # Define directories
+    scores_dir = "scores"
+    output_dir = "output"
+
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Find all CSV files in the scores directory
+    scores_path = Path(scores_dir)
+    csv_files = list(scores_path.glob("*.csv"))
+
+    if not csv_files:
+        print(f"No CSV files found in {scores_dir} directory")
+        return
+
+    # Show which transformations will be applied
+    transformations = []
+    if not args.sqrt and not args.quantile:
+        transformations.append("log (default)")
+    else:
+        if args.sqrt:
+            transformations.append("sqrt")
+        if args.quantile:
+            transformations.append("quantile")
+
+    print(f"Transformations to apply: {', '.join(transformations)}")
+    print(f"Found {len(csv_files)} score files to process...")
+    print()
+
+    # Show member filtering status
+    if args.members_only:
+        print("Member filtering: ENABLED (only community members will be included)")
+    else:
+        print("Member filtering: DISABLED (all users will be included)")
+    print()
+
+    # Process each CSV file
+    for csv_file in csv_files:
+        try:
+            process_scores(
+                str(csv_file), output_dir, args.sqrt, args.quantile, args.members_only
+            )
+            print()
+        except Exception as e:
+            print(f"Error processing {csv_file}: {str(e)}")
+            print()
+
+    print("Processing complete!")
+
 
 if __name__ == "__main__":
     main()
