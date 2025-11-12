@@ -74,11 +74,10 @@ def load_scores(scores_file):
         scores_file (Path): Path to scores CSV file
 
     Returns:
-        list: List of dictionaries with 'i' and 'v' keys
+        list: List of dictionaries with 'i' and 'v' keys, or None if file not found
     """
     if not scores_file.exists():
-        print(f"Warning: {scores_file} not found, using empty scores")
-        return []
+        return None
 
     df = pd.read_csv(scores_file)
 
@@ -144,6 +143,9 @@ def main():
     print()
 
     # Process each seed file
+    processed_count = 0
+    skipped_count = 0
+
     for seed_file in seed_files:
         base_name = seed_file.stem
         community_id = get_community_id(base_name)
@@ -157,14 +159,27 @@ def main():
         scores_file = output_dir / f"{base_name}_users_log.csv"
         scores_data = load_scores(scores_file)
 
+        # Skip if scores file not found
+        if scores_data is None:
+            print(f"⚠️  Skipping {base_name} - scores file not found: {scores_file}")
+            skipped_count += 1
+            print()
+            continue
+
         # Generate JSON file
         output_file = ui_dir / f"{base_name}.json"
         generate_json_file(community_id, seed_data, scores_data, output_file)
+        processed_count += 1
         print()
 
     print("=" * 60)
     print("✓ JSON generation complete!")
     print("=" * 60)
+    print(
+        f"\n✅ Successfully processed: {processed_count}/{len(seed_files)} communities"
+    )
+    if skipped_count > 0:
+        print(f"⚠️  Skipped: {skipped_count} communities (missing scores files)")
     print(f"\nJSON files saved to {ui_dir}/")
 
 
