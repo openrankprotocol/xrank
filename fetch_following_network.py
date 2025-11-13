@@ -8,9 +8,9 @@ This script analyzes the following network within a Twitter/X community by:
 3. Saving the following network to raw/[community_id]_following_network.json
 
 Uses endpoints:
-- /following-ids?username={username}&count=500 to get following IDs
+- /twitter/user/followings to get following users
 
-Rate limited to 10 requests per second to comply with API limits.
+Rate limited to 1,000 requests per second to comply with API limits.
 """
 
 import http.client
@@ -18,7 +18,6 @@ import json
 import os
 import threading
 import time
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -32,7 +31,7 @@ load_dotenv()
 class RateLimiter:
     """Rate limiter to ensure we don't exceed API rate limits"""
 
-    def __init__(self, requests_per_second=10):
+    def __init__(self, requests_per_second=1000):
         self.requests_per_second = requests_per_second
         self.min_interval = 1.0 / requests_per_second  # Minimum time between requests
         self.last_request_time = 0
@@ -86,10 +85,10 @@ def load_config():
 
 def get_api_key():
     """Get API key from environment with proper formatting"""
-    api_key = os.getenv("RAPIDAPI_KEY")
+    api_key = os.getenv("TWITTER_API_KEY")
 
     if not api_key:
-        raise ValueError("RAPIDAPI_KEY not found in environment variables")
+        raise ValueError("TWITTER_API_KEY not found in environment variables")
 
     # Remove surrounding quotes if present
     if api_key.startswith('"') and api_key.endswith('"'):
@@ -98,13 +97,13 @@ def get_api_key():
         api_key = api_key[1:-1]
 
     if not api_key.strip():
-        raise ValueError("RAPIDAPI_KEY is empty after cleaning")
+        raise ValueError("TWITTER_API_KEY is empty after cleaning")
 
     return api_key
 
 
-def make_request(endpoint, params="", max_retries=3, username=None):
-    """Make HTTP request to RapidAPI with rate limiting and exponential backoff"""
+def make_request(endpoint, params=None, max_retries=3, username=None):
+    """Make HTTP request to twitterapi.io with rate limiting and exponential backoff"""
     global request_count, start_time
 
     # Initialize start time on first request
@@ -113,7 +112,8 @@ def make_request(endpoint, params="", max_retries=3, username=None):
 
     for attempt in range(max_retries):
         # Wait for rate limiter before making request
-        rate_limiter.wait_for_token()
+        if rate_limiter:
+            rate_limiter.wait_for_token()
 
         # Increment request counter
         request_count += 1
@@ -127,14 +127,18 @@ def make_request(endpoint, params="", max_retries=3, username=None):
             )
 
         try:
-            conn = http.client.HTTPSConnection("twitter241.p.rapidapi.com")
+            conn = http.client.HTTPSConnection("api.twitterapi.io")
 
             headers = {
-                "x-rapidapi-key": get_api_key(),
-                "x-rapidapi-host": "twitter241.p.rapidapi.com",
+                "X-API-Key": get_api_key(),
             }
 
-            full_endpoint = f"{endpoint}?{params}" if params else endpoint
+            # Build URL with query parameters
+            if params:
+                query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+                full_endpoint = f"{endpoint}?{query_string}"
+            else:
+                full_endpoint = endpoint
 
             conn.request("GET", full_endpoint, headers=headers)
 
@@ -166,7 +170,7 @@ def make_request(endpoint, params="", max_retries=3, username=None):
                 else:
                     error_msg = data.decode("utf-8") if data else "No response data"
                     print(f"Error: HTTP {res.status} - {error_msg}")
-                    if "following-ids" in endpoint and res.status == 404:
+                    if "followings" in endpoint and res.status == 404:
                         print(
                             f"    Possible issues: username may not exist or endpoint may be incorrect"
                         )
@@ -239,10 +243,11 @@ def load_members_list(community_id, raw_data_dir):
 
 
 def get_following_ids(username, max_following=1000):
-    """Get list of user IDs that a user is following"""
-    print(f"  Fetching following IDs for @{username}")
+    """Get list of user IDs and usernames that a user is following using new API"""
+    print(f"  Fetching following for @{username}")
 
-    following_ids_set = set()  # Use set to prevent duplicates
+    following_users = []  # List of dicts with user info
+    following_ids_set = set()  # Track unique IDs
     cursor = None
     page = 0
     max_pages = 10  # Limit to prevent excessive API calls
@@ -250,114 +255,87 @@ def get_following_ids(username, max_following=1000):
     while page < max_pages:
         page += 1
 
-        # URL encode the username to handle special characters
-        encoded_username = urllib.parse.quote(username)
-        params = f"username={encoded_username}&count=1000"
+        # New API uses userName parameter with pageSize (max 200)
+        params = {"userName": username, "pageSize": "200"}
         if cursor:
-            params += f"&cursor={cursor}"
+            params["cursor"] = cursor
 
         print(f"    Page {page}: Making request with cursor={cursor}")
 
-        response = make_request("/following-ids", params, username=username)
+        response = make_request("/twitter/user/followings", params, username=username)
 
         if not response:
             print(f"    Page {page}: No response received")
             break
 
+        # Check API response status
+        if response.get("status") != "success":
+            print(f"    API error: {response.get('message', 'Unknown error')}")
+            break
+
         try:
-            # Extract following IDs from response - simple ids array
-            if "ids" in response:
-                batch_ids = response["ids"]
-                new_ids = set(str(id_val) for id_val in batch_ids)
-                before_count = len(following_ids_set)
-                following_ids_set.update(new_ids)
-                after_count = len(following_ids_set)
-                print(
-                    f"    Page {page}: Got {len(batch_ids)} IDs, {after_count - before_count} new unique IDs"
-                )
-            else:
-                print(f"    Page {page}: No 'ids' field in response")
+            # Extract following users from new API format
+            followings = response.get("followings", [])
 
-            # Look for next cursor - only continue if we have a valid cursor (not 0, -1, or None)
-            next_cursor_value = response.get("next_cursor")
-            print(f"    Page {page}: Next cursor value: {next_cursor_value}")
-
-            # Explicitly check: cursor must exist, not be None, and not be 0 or -1
-            if (
-                next_cursor_value is not None
-                and isinstance(next_cursor_value, (int, str))
-                and next_cursor_value not in [0, -1, "0", "-1"]
-            ):
-                cursor = str(next_cursor_value)
-                print(f"    Page {page}: Continuing with cursor {cursor}")
-            else:
-                print(
-                    f"    Page {page}: End of pagination (cursor: {next_cursor_value})"
-                )
+            if not followings:
+                print(f"    Page {page}: No followings in response")
                 break
 
-            if len(following_ids_set) >= max_following:  # Configurable limit
-                print(f"    Page {page}: Reached ID limit of {max_following}")
+            # Process each following user
+            new_count = 0
+            for following in followings:
+                user_id = following.get("id")
+                if user_id and user_id not in following_ids_set:
+                    following_ids_set.add(user_id)
+                    following_users.append(
+                        {
+                            "user_id": user_id,
+                            "username": following.get("userName", ""),
+                            "display_name": following.get("name", ""),
+                            "followers_count": following.get("followers", 0),
+                            "following_count": following.get("following", 0),
+                            "verified": following.get("isBlueVerified", False),
+                        }
+                    )
+                    new_count += 1
+
+            print(
+                f"    Page {page}: Got {len(followings)} users, {new_count} new unique users (total: {len(following_users)})"
+            )
+
+            # Check for next page
+            if response.get("has_next_page"):
+                cursor = response.get("next_cursor")
+                print(f"    Page {page}: Continuing with cursor {cursor}")
+            else:
+                print(f"    Page {page}: End of pagination")
+                break
+
+            if not cursor:
+                break
+
+            if len(following_users) >= max_following:
+                print(f"    Page {page}: Reached limit of {max_following}")
                 break
 
         except Exception as e:
-            print(f"    Page {page}: Error parsing following IDs for @{username}: {e}")
+            print(f"    Page {page}: Error parsing followings for @{username}: {e}")
+            import traceback
+
+            traceback.print_exc()
             break
 
-    following_ids_list = list(following_ids_set)
-    print(f"    Found {len(following_ids_list)} unique following IDs for @{username}")
-    return following_ids_list
+    print(f"    Found {len(following_users)} unique following users for @{username}")
+    return following_users
 
 
 def get_users_by_ids(user_ids):
-    """Get user information by user IDs (batch request)"""
-    if not user_ids:
-        return []
-
-    # Convert list to comma-separated string and URL encode
-    user_ids_str = ",".join(str(uid) for uid in user_ids)
-    encoded_user_ids = urllib.parse.quote(user_ids_str)
-
-    print(f"  Fetching user info for {len(user_ids)} users")
-
-    params = f"users={encoded_user_ids}"
-    response = make_request("/get-users-v2", params, 3)
-
-    if not response:
-        return []
-
-    users = []
-    try:
-        if "result" in response:
-            for user_data in response["result"]:
-                users.append(
-                    {
-                        "username": user_data.get("screen_name", ""),
-                        "user_id": user_data.get("id_str", ""),
-                        "display_name": user_data.get("name", ""),
-                        "followers_count": user_data.get("followers_count", 0),
-                        "following_count": user_data.get("friends_count", 0),
-                        "verified": user_data.get("verified", False),
-                    }
-                )
-
-    except Exception as e:
-        print(f"    Error parsing users data: {e}")
-        print(
-            f"    Response structure: {list(response.keys()) if response else 'None'}"
-        )
-
-    print(f"    Retrieved info for {len(users)} users")
-
-    # Show sample of parsed users for debugging
-    if users and len(users) <= 5:
-        sample_usernames = ", ".join(f"@{u['username']}" for u in users[:3])
-        print(f"    Sample users: {sample_usernames}")
-    elif users:
-        sample_usernames = ", ".join(f"@{u['username']}" for u in users[:3])
-        print(f"    Sample users: {sample_usernames}...")
-
-    return users
+    """
+    No longer needed - new API returns full user info with followings.
+    This function is kept for backwards compatibility but returns empty list.
+    """
+    print(f"  Note: get_users_by_ids is deprecated with new API")
+    return []
 
 
 def save_extended_members_checkpoint(community_id, extended_members, raw_data_dir):
@@ -398,9 +376,11 @@ def load_extended_members_checkpoint(community_id, raw_data_dir):
 
             # Apply current extended_members_limit from config
             config = load_config()
-            extended_members_limit = config.get("data", {}).get(
-                "extended_members_limit", 100000
-            )
+            extended_members_limit = 100000
+            if config:
+                extended_members_limit = config.get("data", {}).get(
+                    "extended_members_limit", 100000
+                )
 
             if len(extended_members_list) > extended_members_limit:
                 # Sort by following_count and take top N
@@ -452,7 +432,11 @@ def build_extended_members(members, community_id, raw_data_dir):
 
     # Load config for following limits
     config = load_config()
-    max_following_per_user = config.get("data", {}).get("max_following_per_user", 1000)
+    max_following_per_user = 1000
+    if config:
+        max_following_per_user = config.get("data", {}).get(
+            "max_following_per_user", 1000
+        )
 
     extended_members = {}  # Use dict to avoid duplicates
 
@@ -460,35 +444,24 @@ def build_extended_members(members, community_id, raw_data_dir):
         print(f"\nProcessing member {i + 1}/{len(members)}: @{member['username']}")
 
         try:
-            # Get IDs of users this member follows
-            following_ids = get_following_ids(
+            # Get users this member follows (new API returns full user info)
+            following_users = get_following_ids(
                 member["username"], max_following_per_user
             )
 
-            if following_ids:
-                # Process in batches of 100 (API limit)
-                batch_size = 100
-                for j in range(0, len(following_ids), batch_size):
-                    batch_ids = following_ids[j : j + batch_size]
-
-                    # Get user info for this batch
-                    batch_users = get_users_by_ids(batch_ids)
-
-                    # Add to extended members (use user_id as key to avoid duplicates)
-                    for user in batch_users:
-                        if user.get("user_id") and user.get("username"):
-                            extended_members[user["user_id"]] = {
-                                "username": user["username"],
-                                "user_id": user["user_id"],
-                                "display_name": user.get("display_name", ""),
-                                "type": "extended_member",
-                                "followers_count": user.get("followers_count", 0),
-                                "following_count": user.get("following_count", 0),
-                                "verified": user.get("verified", False),
-                            }
-
-                    # Small delay between batches
-                    time.sleep(0.5)
+            if following_users:
+                # Add to extended members (use user_id as key to avoid duplicates)
+                for user in following_users:
+                    if user.get("user_id") and user.get("username"):
+                        extended_members[user["user_id"]] = {
+                            "username": user["username"],
+                            "user_id": user["user_id"],
+                            "display_name": user.get("display_name", ""),
+                            "type": "extended_member",
+                            "followers_count": user.get("followers_count", 0),
+                            "following_count": user.get("following_count", 0),
+                            "verified": user.get("verified", False),
+                        }
 
         except Exception as e:
             print(f"Error processing member @{member['username']}: {e}")
@@ -499,9 +472,11 @@ def build_extended_members(members, community_id, raw_data_dir):
 
     # Rank by following_count and take top users based on config
     config = load_config()
-    extended_members_limit = config.get("data", {}).get(
-        "extended_members_limit", 100000
-    )
+    extended_members_limit = 100000
+    if config:
+        extended_members_limit = config.get("data", {}).get(
+            "extended_members_limit", 100000
+        )
 
     # Sort by following_count (descending) and take top N
     sorted_extended_members = sorted(
@@ -535,9 +510,11 @@ def create_master_list(members, extended_members):
 
     # Apply extended_members_limit if needed
     config = load_config()
-    extended_members_limit = config.get("data", {}).get(
-        "extended_members_limit", 100000
-    )
+    extended_members_limit = 100000
+    if config:
+        extended_members_limit = config.get("data", {}).get(
+            "extended_members_limit", 100000
+        )
 
     if len(extended_members) > extended_members_limit:
         # Sort by following_count and take top N
@@ -575,18 +552,23 @@ def process_single_user(user, master_user_ids, user_id_to_username, index, total
     print(f"\nAnalyzing user {index + 1}/{total}: @{user['username']}")
 
     try:
-        # Get users this person follows
+        # Get users this person follows (new API returns full user info)
         config = load_config()
-        max_following_per_user = config.get("data", {}).get(
-            "max_following_per_user", 1000
-        )
-        following_ids = get_following_ids(user["username"], max_following_per_user)
+        max_following_per_user = 1000
+        if config:
+            max_following_per_user = config.get("data", {}).get(
+                "max_following_per_user", 1000
+            )
+        following_users = get_following_ids(user["username"], max_following_per_user)
 
         # Filter to only include users in master list
         following_in_master = []
-        for following_id in following_ids:
+        for following_user in following_users:
+            following_id = following_user.get("user_id")
             if following_id in master_user_ids:
-                following_username = user_id_to_username.get(following_id)
+                following_username = following_user.get(
+                    "username"
+                ) or user_id_to_username.get(following_id)
                 if following_username:
                     following_in_master.append(following_username)
 
@@ -733,6 +715,9 @@ def save_following_network(community_id, following_network, raw_data_dir):
 def main():
     """Main function - build and analyze following network"""
     global rate_limiter, request_count, start_time
+
+    # Initialize to avoid unbound variable in exception handler
+    raw_data_dir = "./raw"
 
     try:
         # Load configuration

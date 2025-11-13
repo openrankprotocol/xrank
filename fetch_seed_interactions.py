@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """
-Community Members Interactions Fetcher
+Seed Users Interactions Fetcher
 
-This script fetches all interactions from community members by:
-1. Loading the list of members from fetch_members.py output
-2. Fetching all posts/tweets of these members going back days_back time
-3. Including regular posts, community posts, and replies to any other posts
-4. Saving the data to raw/[community_id]_members_interactions.json
+This script fetches all interactions from users in the seed followings master list:
+1. Loads raw/seed_followings.json (created by fetch_seed_followings.py)
+2. Fetches all posts/tweets and replies from each user in the master list
+3. Applies days_back and post_limit from config.toml
+4. Saves the data to raw/seed_interactions.json
 
 Uses endpoints:
 - /twitter/user/last_tweets for user timeline posts (includes original posts, retweets, quotes, and replies)
-
-Enhanced Data Structure:
-- For retweets: Preserves original_post_creator_id and original_post_creator_username
-- For quotes: Preserves original_post_creator_id and original_post_creator_username
-- For replies: Preserves reply_to_user_id and reply_to_username
-- Preserves community_id and is_community_post flag when posts are made to communities
-- No separate community interaction classification - community context preserved in post data
 
 Rate limited to 1,000 requests per second to comply with API limits.
 """
@@ -27,7 +20,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import toml
 from dotenv import load_dotenv
@@ -183,115 +176,30 @@ def make_request(endpoint, params=None, max_retries=3):
     return None
 
 
-def save_checkpoint(community_id, processed_members, raw_data_dir):
-    """Save checkpoint data to resume processing later"""
-    checkpoint_file = os.path.join(
-        raw_data_dir, f"{community_id}_member_interactions_checkpoint.json"
-    )
-    checkpoint_data = {
-        "community_id": community_id,
-        "timestamp": datetime.now().isoformat(),
-        "processed_members": processed_members,
-        "total_processed": len(processed_members),
-    }
-
-    os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
-    with open(checkpoint_file, "w", encoding="utf-8") as f:
-        json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
-
-    print(f"Checkpoint saved: {len(processed_members)} members processed")
-
-
-def load_checkpoint(community_id, raw_data_dir):
-    """Load checkpoint data to resume processing"""
-    checkpoint_file = os.path.join(
-        raw_data_dir, f"{community_id}_member_interactions_checkpoint.json"
-    )
-
-    if os.path.exists(checkpoint_file):
-        try:
-            with open(checkpoint_file, "r", encoding="utf-8") as f:
-                checkpoint_data = json.load(f)
-
-            print(
-                f"Found checkpoint: {len(checkpoint_data.get('processed_members', []))} members already processed"
-            )
-            return checkpoint_data.get("processed_members", [])
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-            return []
-
-    return []
-
-
-def cleanup_checkpoint(community_id, raw_data_dir):
-    """Remove checkpoint file after successful completion"""
-    checkpoint_file = os.path.join(
-        raw_data_dir, f"{community_id}_member_interactions_checkpoint.json"
-    )
-
-    if os.path.exists(checkpoint_file):
-        try:
-            os.remove(checkpoint_file)
-            print(f"Checkpoint file cleaned up")
-        except Exception as e:
-            print(f"Warning: Could not remove checkpoint file: {e}")
-
-
-def get_processed_usernames(processed_members):
-    """Extract usernames from processed members list"""
-    return {
-        member.get("username", "").lower()
-        for member in processed_members
-        if member.get("username")
-    }
-
-
-def load_members_list(community_id, raw_data_dir):
-    """Load the members list from fetch_members.py output"""
-    filename = os.path.join(raw_data_dir, f"{community_id}_members.json")
+def load_seed_followings(raw_data_dir):
+    """Load the seed followings master list"""
+    filename = os.path.join(raw_data_dir, "seed_followings.json")
 
     if not os.path.exists(filename):
-        print(f"Error: Members file not found: {filename}")
-        print("Please run fetch_members.py first to generate the members list.")
+        print(f"Error: Seed followings file not found: {filename}")
+        print("Please run fetch_seed_followings.py first to generate the master list.")
         return None
 
     try:
         with open(filename, "r", encoding="utf-8") as f:
-            members_data = json.load(f)
+            data = json.load(f)
 
-        # Extract all members and moderators with their IDs
-        all_members = []
+        master_list = data.get("master_list", [])
+        seed_users = data.get("seed_users", [])
 
-        # Add regular members
-        for member in members_data.get("members", []):
-            if member.get("username") and member.get("user_id"):
-                all_members.append(
-                    {
-                        "username": member["username"],
-                        "user_id": member["user_id"],
-                        "display_name": member.get("display_name", ""),
-                        "role": "member",
-                    }
-                )
+        print(f"Loaded seed followings from {filename}")
+        print(f"  - Seed users: {len(seed_users)}")
+        print(f"  - Total users in master list: {len(master_list)}")
 
-        # Add moderators
-        for moderator in members_data.get("moderators", []):
-            if moderator.get("username") and moderator.get("user_id"):
-                all_members.append(
-                    {
-                        "username": moderator["username"],
-                        "user_id": moderator["user_id"],
-                        "display_name": moderator.get("display_name", ""),
-                        "role": "moderator",
-                    }
-                )
-
-        print(f"Loaded {len(all_members)} community members from {filename}")
-        return all_members
+        return master_list
 
     except Exception as e:
-        print(f"Error loading members file {filename}: {e}")
+        print(f"Error loading seed followings: {e}")
         return None
 
 
@@ -300,8 +208,6 @@ def is_post_within_days(created_at_str, days_back):
     try:
         if not created_at_str:
             return False
-
-        from datetime import timezone
 
         # Try multiple date formats
         post_date = None
@@ -356,9 +262,6 @@ def extract_post_data(tweet):
             "created_at": tweet.get("createdAt", ""),
             "user_id": author.get("id", ""),
             "username": author.get("userName", ""),
-            "is_community_post": False,  # New API doesn't seem to include community info in sample
-            "community_id": None,
-            "community_name": None,
             "is_retweet": is_retweet,
             "is_reply": is_reply,
             "is_quote": is_quote,
@@ -369,6 +272,11 @@ def extract_post_data(tweet):
             "quoted_post_id": None,
             "original_post_creator_id": None,
             "original_post_creator_username": None,
+            "retweet_count": tweet.get("retweetCount", 0),
+            "reply_count": tweet.get("replyCount", 0),
+            "like_count": tweet.get("likeCount", 0),
+            "quote_count": tweet.get("quoteCount", 0),
+            "view_count": tweet.get("viewCount", 0),
         }
 
         # Extract retweeted post data if available
@@ -451,9 +359,13 @@ def get_user_tweets(username, user_id, days_back, max_tweets=1000):
             data = response.get("data", {})
             tweets = data.get("tweets", [])
 
+            if not tweets:
+                break
+
             for tweet in tweets:
                 # Check if within date range
                 created_at = tweet.get("createdAt")
+
                 if is_post_within_days(created_at, days_back):
                     extracted = extract_post_data(tweet)
                     if extracted:
@@ -488,134 +400,130 @@ def get_user_tweets(username, user_id, days_back, max_tweets=1000):
     return content
 
 
-def fetch_member_interactions(member, days_back, community_id):
-    """Fetch all interactions for a single member"""
-    username = member["username"]
-    user_id = member["user_id"]
+def fetch_user_interactions(user, days_back, post_limit):
+    """Fetch all interactions for a single user"""
+    username = user.get("username", "")
+    user_id = user.get("user_id", "")
+    user_type = user.get("type", "unknown")
 
-    print(f"\nProcessing member: @{username} ({member['role']})")
+    if not username or not user_id:
+        print(f"  Skipping user with missing username or ID")
+        return None
 
-    member_data = {
+    print(f"\nProcessing user: @{username} (type: {user_type})")
+
+    user_data = {
         "username": username,
         "user_id": user_id,
-        "display_name": member["display_name"],
-        "role": member["role"],
+        "display_name": user.get("display_name", ""),
+        "type": user_type,
         "posts": [],
         "replies": [],
     }
 
     # Get user's tweets and replies (now combined in one endpoint)
-    all_content = get_user_tweets(username, user_id, days_back)
+    all_content = get_user_tweets(username, user_id, days_back, max_tweets=post_limit)
 
     # Separate posts and replies based on is_reply flag
     for item in all_content:
         if item:
             if item.get("is_reply"):
-                member_data["replies"].append(item)
+                user_data["replies"].append(item)
             else:
-                member_data["posts"].append(item)
+                user_data["posts"].append(item)
 
     print(
-        f"  Found {len(member_data['posts'])} posts and {len(member_data['replies'])} replies"
+        f"  Found {len(user_data['posts'])} posts and {len(user_data['replies'])} replies"
     )
 
-    return member_data
+    return user_data
 
 
-def analyze_interaction_types(members_interactions):
-    """Analyze the types of interactions found"""
-    stats = {
-        "total_posts": 0,
-        "total_replies": 0,
-        "retweets": 0,
-        "quotes": 0,
-        "original_posts": 0,
-        "reply_interactions": 0,
-        "community_posts": 0,
-        "community_replies": 0,
+def save_checkpoint(users_interactions, raw_data_dir):
+    """Save checkpoint to allow resuming"""
+    checkpoint_file = os.path.join(raw_data_dir, "seed_interactions_checkpoint.json")
+    os.makedirs(raw_data_dir, exist_ok=True)
+
+    try:
+        with open(checkpoint_file, "w", encoding="utf-8") as f:
+            json.dump(users_interactions, f, indent=2, ensure_ascii=False)
+        print(f"  Checkpoint saved: {len(users_interactions)} users processed")
+    except Exception as e:
+        print(f"  Warning: Could not save checkpoint: {e}")
+
+
+def load_checkpoint(raw_data_dir):
+    """Load checkpoint if exists"""
+    checkpoint_file = os.path.join(raw_data_dir, "seed_interactions_checkpoint.json")
+
+    if not os.path.exists(checkpoint_file):
+        return []
+
+    try:
+        with open(checkpoint_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Could not load checkpoint: {e}")
+        return []
+
+
+def cleanup_checkpoint(raw_data_dir):
+    """Remove checkpoint file after successful completion"""
+    checkpoint_file = os.path.join(raw_data_dir, "seed_interactions_checkpoint.json")
+
+    try:
+        if os.path.exists(checkpoint_file):
+            os.remove(checkpoint_file)
+            print(f"Checkpoint file removed")
+    except Exception as e:
+        print(f"Warning: Could not remove checkpoint file: {e}")
+
+
+def get_processed_usernames(processed_users):
+    """Extract usernames from processed users list"""
+    return {
+        user.get("username", "").lower()
+        for user in processed_users
+        if user.get("username")
     }
 
-    for member in members_interactions:
-        stats["total_posts"] += len(member["posts"])
-        stats["total_replies"] += len(member["replies"])
 
-        # Analyze posts
-        for post in member["posts"]:
-            if post.get("is_community_post"):
-                stats["community_posts"] += 1
+def save_interactions_data(users_interactions, raw_data_dir):
+    """Save interactions data to JSON file"""
+    filename = os.path.join(raw_data_dir, "seed_interactions.json")
+    os.makedirs(raw_data_dir, exist_ok=True)
 
-            if post.get("is_retweet"):
-                stats["retweets"] += 1
-            elif post.get("is_quote"):
-                stats["quotes"] += 1
-            else:
-                stats["original_posts"] += 1
+    # Organize data by user type
+    seed_users = [u for u in users_interactions if u.get("type") == "seed"]
+    following_users = [u for u in users_interactions if u.get("type") == "following"]
 
-        # Analyze replies
-        for reply in member["replies"]:
-            if reply.get("is_community_post"):
-                stats["community_replies"] += 1
-
-            if reply.get("reply_to_post_id"):
-                stats["reply_interactions"] += 1
-
-    return stats
-
-
-def save_interactions_data(community_id, members_interactions, raw_data_dir):
-    """Save all member interactions to file"""
-
-    # Analyze interaction types
-    interaction_stats = analyze_interaction_types(members_interactions)
-
-    # Create output data structure
     output_data = {
-        "community_id": community_id,
         "timestamp": datetime.now().isoformat(),
-        "summary": {
-            "total_members_processed": len(members_interactions),
-            "total_posts_fetched": interaction_stats["total_posts"],
-            "total_replies_fetched": interaction_stats["total_replies"],
-            "total_interactions": interaction_stats["total_posts"]
-            + interaction_stats["total_replies"],
-            "interaction_breakdown": {
-                "original_posts": interaction_stats["original_posts"],
-                "retweets": interaction_stats["retweets"],
-                "quotes": interaction_stats["quotes"],
-                "replies": interaction_stats["reply_interactions"],
-                "community_posts": interaction_stats["community_posts"],
-                "community_replies": interaction_stats["community_replies"],
-            },
-        },
-        "members_interactions": members_interactions,
+        "total_users": len(users_interactions),
+        "seed_users_count": len(seed_users),
+        "following_users_count": len(following_users),
+        "users": users_interactions,
     }
-
-    # Save to file
-    filename = os.path.join(raw_data_dir, f"{community_id}_members_interactions.json")
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
 
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
-    print(f"\nMember interactions saved to: {filename}")
-    print(f"Summary:")
-    print(f"- Members processed: {len(members_interactions)}")
-    print(f"- Total posts: {interaction_stats['total_posts']}")
-    print(f"  * Original posts: {interaction_stats['original_posts']}")
-    print(f"  * Retweets: {interaction_stats['retweets']}")
-    print(f"  * Quotes: {interaction_stats['quotes']}")
-    print(f"  * Community posts: {interaction_stats['community_posts']}")
-    print(f"- Total replies: {interaction_stats['total_replies']}")
-    print(f"  * Community replies: {interaction_stats['community_replies']}")
-    print(
-        f"- Total interactions: {interaction_stats['total_posts'] + interaction_stats['total_replies']}"
-    )
+    print(f"\n✓ Saved interactions data to: {filename}")
+    print(f"  - Seed users: {len(seed_users)}")
+    print(f"  - Following users: {len(following_users)}")
+    print(f"  - Total users: {len(users_interactions)}")
 
-    return filename, output_data["summary"]
+    # Calculate stats
+    total_posts = sum(len(u.get("posts", [])) for u in users_interactions)
+    total_replies = sum(len(u.get("replies", [])) for u in users_interactions)
+    print(f"  - Total posts: {total_posts}")
+    print(f"  - Total replies: {total_replies}")
+
+    return filename
 
 
 def main():
-    """Main function - fetch community member interactions and save to JSON files"""
+    """Main function - fetch seed users interactions and save to JSON files"""
     global rate_limiter, request_count, start_time
 
     # Initialize to avoid unbound variable in exception handler
@@ -628,7 +536,9 @@ def main():
             return
 
         # Initialize rate limiter with config values
-        requests_per_second = config["rate_limiting"]["requests_per_second"]
+        requests_per_second = config.get("rate_limiting", {}).get(
+            "requests_per_second", 1000
+        )
         rate_limiter = RateLimiter(requests_per_second)
 
         # Get max_parallel parameter (default to 4 if not in config)
@@ -638,98 +548,92 @@ def main():
         request_count = 0
         start_time = None
 
-        print(f"Community Members Interactions Fetcher")
+        print(f"Seed Users Interactions Fetcher")
         print(f"Rate limiting: {requests_per_second} requests/second")
         print(f"Max parallel users: {max_parallel}")
         print(f"=" * 60)
 
-        community_ids = config["communities"]["ids"]
-        raw_data_dir = config["output"]["raw_data_dir"]
-        days_back = config["data"]["days_back"]
-        community_delay = config["rate_limiting"]["community_delay"]
+        raw_data_dir = config.get("output", {}).get("raw_data_dir", "./raw")
+        days_back = config.get("data", {}).get("days_back", 365)
+        post_limit_per_user = config.get("data", {}).get("post_limit_per_user", 500)
 
-        for i, community_id in enumerate(community_ids):
-            print(f"\n{'=' * 60}")
-            print(f"Processing community {i + 1}/{len(community_ids)}: {community_id}")
-            print(f"{'=' * 60}")
+        print(f"Configuration:")
+        print(f"  - Days back: {days_back}")
+        print(f"  - Post limit per user: {post_limit_per_user}")
+        print(f"  - Raw data directory: {raw_data_dir}")
 
-            # Load members list for this community
-            members = load_members_list(community_id, raw_data_dir)
-            if not members:
-                print(f"Skipping community {community_id} - no members found")
-                continue
+        # Load seed followings master list
+        master_list = load_seed_followings(raw_data_dir)
+        if not master_list:
+            print("Error: Could not load seed followings")
+            return
 
-            # Load checkpoint if exists
-            processed_members = load_checkpoint(community_id, raw_data_dir)
-            processed_usernames = get_processed_usernames(processed_members)
+        # Load checkpoint if exists
+        processed_users = load_checkpoint(raw_data_dir)
+        processed_usernames = get_processed_usernames(processed_users)
 
-            # Filter out already processed members
-            remaining_members = [
-                m
-                for m in members
-                if m.get("username", "").lower() not in processed_usernames
-            ]
+        # Filter out already processed users
+        remaining_users = [
+            u
+            for u in master_list
+            if u.get("username", "").lower() not in processed_usernames
+        ]
 
-            print(f"Total members: {len(members)}")
-            print(f"Already processed: {len(processed_members)}")
-            print(f"Remaining to process: {len(remaining_members)}")
+        print(f"\nTotal users in master list: {len(master_list)}")
+        print(f"Already processed: {len(processed_users)}")
+        print(f"Remaining to process: {len(remaining_users)}")
 
-            # Start with existing processed members
-            members_interactions = processed_members.copy()
+        # Start with existing processed users
+        users_interactions = processed_users.copy()
 
-            # Process remaining members in parallel batches
-            batch_size = max_parallel
-            for batch_start in range(0, len(remaining_members), batch_size):
-                batch_end = min(batch_start + batch_size, len(remaining_members))
-                batch_members = remaining_members[batch_start:batch_end]
+        # Process remaining users in parallel batches
+        batch_size = max_parallel
+        for batch_start in range(0, len(remaining_users), batch_size):
+            batch_end = min(batch_start + batch_size, len(remaining_users))
+            batch_users = remaining_users[batch_start:batch_end]
 
-                print(
-                    f"\nProcessing batch {batch_start // batch_size + 1}: members {batch_start + 1}-{batch_end} of {len(remaining_members)}"
-                )
+            print(
+                f"\nProcessing batch {batch_start // batch_size + 1}: users {batch_start + 1}-{batch_end} of {len(remaining_users)}"
+            )
 
-                # Process batch in parallel
-                with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-                    # Submit all members in batch
-                    future_to_member = {
-                        executor.submit(
-                            fetch_member_interactions, member, days_back, community_id
-                        ): member
-                        for member in batch_members
-                    }
+            # Process batch in parallel
+            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                # Submit all users in batch
+                future_to_user = {
+                    executor.submit(
+                        fetch_user_interactions, user, days_back, post_limit_per_user
+                    ): user
+                    for user in batch_users
+                }
 
-                    # Collect results as they complete
-                    for future in as_completed(future_to_member):
-                        member = future_to_member[future]
-                        try:
-                            member_data = future.result()
-                            if member_data:  # Only add if we got valid data
-                                members_interactions.append(member_data)
-                                print(f"  ✓ Completed @{member['username']}")
-                        except Exception as e:
-                            print(
-                                f"  ✗ Error processing member @{member['username']}: {e}"
-                            )
-                            # Continue with other members even if one fails
-                            continue
+                # Collect results as they complete
+                for future in as_completed(future_to_user):
+                    user = future_to_user[future]
+                    try:
+                        user_data = future.result()
+                        if user_data:  # Only add if we got valid data
+                            users_interactions.append(user_data)
+                            print(f"  ✓ Completed @{user.get('username', 'unknown')}")
+                    except Exception as e:
+                        print(
+                            f"  ✗ Error processing user @{user.get('username', 'unknown')}: {e}"
+                        )
+                        # Continue with other users even if one fails
+                        continue
 
-                # Save checkpoint after each batch
-                save_checkpoint(community_id, members_interactions, raw_data_dir)
-                print(
-                    f"Progress: {len(members_interactions)}/{len(members)} members processed"
-                )
+            # Save checkpoint after each batch
+            save_checkpoint(users_interactions, raw_data_dir)
+            print(
+                f"Progress: {len(users_interactions)}/{len(master_list)} users processed"
+            )
 
-            # Save interactions data
-            if members_interactions:
-                save_interactions_data(community_id, members_interactions, raw_data_dir)
-                # Clean up checkpoint file after successful completion
-                cleanup_checkpoint(community_id, raw_data_dir)
-            else:
-                print(f"No interactions data collected for community {community_id}")
-
-            # Delay between communities
-            if i < len(community_ids) - 1:
-                print(f"\nWaiting {community_delay} seconds before next community...")
-                time.sleep(community_delay)
+        # Save interactions data
+        if users_interactions:
+            save_interactions_data(users_interactions, raw_data_dir)
+            # Clean up checkpoint file after successful completion
+            cleanup_checkpoint(raw_data_dir)
+        else:
+            print(f"No interactions data collected")
 
         # Final summary
         if start_time:
@@ -738,19 +642,19 @@ def main():
             print(f"\n{'=' * 60}")
             print(f"INTERACTIONS FETCH COMPLETE")
             print(f"{'=' * 60}")
-            print(f"Communities processed: {len(community_ids)}")
+            print(f"Users processed: {len(users_interactions)}")
             print(f"API Usage Summary:")
             print(f"- Total requests: {request_count}")
             print(f"- Total time: {total_time:.1f} seconds")
             print(f"- Average rate: {avg_rate:.2f} requests/second")
 
-        print(f"\nOutput files saved in {raw_data_dir}:")
-        print(f"- [community_id]_members_interactions.json")
+        print(f"\nOutput file saved in {raw_data_dir}:")
+        print(f"- seed_interactions.json")
 
     except Exception as e:
         print(f"Error: {str(e)}")
-        print(f"\nCheckpoint files are preserved in {raw_data_dir} for resuming:")
-        print(f"- [community_id]_member_interactions_checkpoint.json")
+        print(f"\nCheckpoint file is preserved in {raw_data_dir} for resuming:")
+        print(f"- seed_interactions_checkpoint.json")
         import traceback
 
         traceback.print_exc()

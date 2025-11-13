@@ -7,11 +7,11 @@ days_back = 365
 # Maximum posts per community (0 = unlimited)
 post_limit = 10000
 
-# Maximum extended members to keep (ranked by following_count)
-extended_members_limit = 10000
-
 # Maximum following IDs to fetch per user
 max_following_per_user = 1000
+
+# Maximum posts to fetch per user (for seed interactions)
+post_limit_per_user = 500
 
 [communities]
 # List of community IDs to fetch from
@@ -24,6 +24,16 @@ ids = [
     "1966141414703509919", # Sentient
 ]
 
+[seed_users]
+usernames = [
+    # "Saldasoro",
+    # "oyealmond",
+    # "gui_bettanin",
+    # "anabelen_eth",
+    # "Lalocripto",
+    "carlosjmelgar",
+]
+
 [output]
 # Directory for raw data output
 raw_data_dir = "./raw"
@@ -31,11 +41,11 @@ raw_data_dir = "./raw"
 # File naming (using fixed name)
 
 [rate_limiting]
-# Maximum requests per second (Twitter API limit: 10)
-requests_per_second = 10
+# Maximum requests per second (Twitter API limit: 1,000)
+requests_per_second = 1000
 
 # Maximum parallel requests when fetching posts for a user (default: 4)
-max_parallel_requests = 30
+max_parallel_requests = 100
 
 # Delay between requests (seconds) - calculated as 1/requests_per_second
 request_delay = 0.0

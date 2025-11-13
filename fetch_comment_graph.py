@@ -10,10 +10,10 @@ This script analyzes comment interactions within a Twitter/X community by:
 5. Saving to raw/[community_id]_comment_graph.json
 
 Uses endpoints:
-- /community-tweets?communityId={id}&searchType=Default&rankingMode=Recency&count=1000
-- /comments-v2?pid={post_id}&rankingMode=Relevance&count=1000
+- /twitter/community/tweets for community posts
+- /comments-v2 (still using old API - needs new endpoint when available)
 
-Rate limited to 10 requests per second to comply with API limits.
+Rate limited to 1,000 requests per second to comply with API limits.
 """
 
 import http.client
@@ -21,7 +21,6 @@ import json
 import os
 import threading
 import time
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
@@ -35,7 +34,7 @@ load_dotenv()
 class RateLimiter:
     """Rate limiter to ensure we don't exceed API rate limits"""
 
-    def __init__(self, requests_per_second=10):
+    def __init__(self, requests_per_second=1000):
         self.requests_per_second = requests_per_second
         self.min_interval = 1.0 / requests_per_second  # Minimum time between requests
         self.last_request_time = 0
@@ -82,12 +81,21 @@ def load_config():
         return None
 
 
-def get_api_key():
-    """Get API key from environment with proper formatting"""
-    api_key = os.getenv("RAPIDAPI_KEY")
+def get_api_key(use_old_api=False):
+    """Get API key from environment with proper formatting
+
+    Args:
+        use_old_api: If True, returns RAPIDAPI_KEY for old API, else TWITTER_API_KEY for new API
+    """
+    if use_old_api:
+        api_key = os.getenv("RAPIDAPI_KEY")
+        key_name = "RAPIDAPI_KEY"
+    else:
+        api_key = os.getenv("TWITTER_API_KEY")
+        key_name = "TWITTER_API_KEY"
 
     if not api_key:
-        raise ValueError("RAPIDAPI_KEY not found in environment variables")
+        raise ValueError(f"{key_name} not found in environment variables")
 
     # Remove surrounding quotes if present
     if api_key.startswith('"') and api_key.endswith('"'):
@@ -96,13 +104,17 @@ def get_api_key():
         api_key = api_key[1:-1]
 
     if not api_key.strip():
-        raise ValueError("RAPIDAPI_KEY is empty after cleaning")
+        raise ValueError(f"{key_name} is empty after cleaning")
 
     return api_key
 
 
-def make_request(endpoint, params="", max_retries=3):
-    """Make HTTP request to RapidAPI with rate limiting and exponential backoff"""
+def make_request(endpoint, params=None, max_retries=3, use_old_api=False):
+    """Make HTTP request with rate limiting and exponential backoff
+
+    Supports both new twitterapi.io API and old RapidAPI for backwards compatibility.
+    Old API is used for endpoints that haven't been migrated yet (e.g., comments-v2).
+    """
     global request_count, start_time
 
     # Initialize start time on first request
@@ -111,7 +123,8 @@ def make_request(endpoint, params="", max_retries=3):
 
     for attempt in range(max_retries):
         # Wait for rate limiter before making request
-        rate_limiter.wait_for_token()
+        if rate_limiter:
+            rate_limiter.wait_for_token()
 
         # Increment request counter
         request_count += 1
@@ -123,14 +136,37 @@ def make_request(endpoint, params="", max_retries=3):
             print(f"📊 API: {request_count} requests, {rate:.2f}/sec")
 
         try:
-            conn = http.client.HTTPSConnection("twitter241.p.rapidapi.com")
-
-            headers = {
-                "x-rapidapi-key": get_api_key(),
-                "x-rapidapi-host": "twitter241.p.rapidapi.com",
-            }
-
-            full_endpoint = f"{endpoint}?{params}" if params else endpoint
+            # Determine which API to use based on endpoint
+            # Comments endpoint still uses old RapidAPI
+            if use_old_api or endpoint.startswith("/comments"):
+                conn = http.client.HTTPSConnection("twitter241.p.rapidapi.com")
+                headers = {
+                    "x-rapidapi-key": get_api_key(use_old_api=True),
+                    "x-rapidapi-host": "twitter241.p.rapidapi.com",
+                }
+                # Old API uses string params
+                if isinstance(params, dict):
+                    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+                    full_endpoint = (
+                        f"{endpoint}?{query_string}" if query_string else endpoint
+                    )
+                else:
+                    full_endpoint = f"{endpoint}?{params}" if params else endpoint
+            else:
+                # New API
+                conn = http.client.HTTPSConnection("api.twitterapi.io")
+                headers = {
+                    "X-API-Key": get_api_key(use_old_api=False),
+                }
+                # Build URL with query parameters
+                if params:
+                    if isinstance(params, dict):
+                        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+                    else:
+                        query_string = params
+                    full_endpoint = f"{endpoint}?{query_string}"
+                else:
+                    full_endpoint = endpoint
 
             conn.request("GET", full_endpoint, headers=headers)
 
@@ -230,24 +266,43 @@ def load_master_list(community_id, raw_data_dir):
     return master_list, user_id_lookup, username_lookup
 
 
-def is_post_within_days(post_data, days_back):
+def is_post_within_days(created_at_str, days_back):
     """Check if post is within the specified days back"""
     try:
-        if "created_at" in post_data:
-            created_at = post_data["created_at"]
-        elif "tweet" in post_data and "legacy" in post_data["tweet"]:
-            created_at = post_data["tweet"]["legacy"].get("created_at")
-        elif "legacy" in post_data:
-            created_at = post_data["legacy"].get("created_at")
-        else:
+        if not created_at_str:
             return False
 
-        if not created_at:
+        from datetime import timezone
+
+        # Try multiple date formats
+        post_date = None
+
+        # Format 1: Twitter's old format "Wed Nov 12 15:59:13 +0000 2025"
+        try:
+            post_date = datetime.strptime(created_at_str, "%a %b %d %H:%M:%S %z %Y")
+        except:
+            pass
+
+        # Format 2: ISO 8601 with milliseconds "2024-01-15T10:30:45.123Z"
+        if not post_date and "." in created_at_str:
+            try:
+                post_date = datetime.strptime(created_at_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+                post_date = post_date.replace(tzinfo=timezone.utc)
+            except:
+                pass
+
+        # Format 3: ISO 8601 without milliseconds "2024-01-15T10:30:45Z"
+        if not post_date:
+            try:
+                post_date = datetime.strptime(created_at_str, "%Y-%m-%dT%H:%M:%SZ")
+                post_date = post_date.replace(tzinfo=timezone.utc)
+            except:
+                pass
+
+        if not post_date:
             return False
 
-        # Parse Twitter's date format
-        post_date = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
-        cutoff_date = datetime.now(post_date.tzinfo) - timedelta(days=days_back)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
 
         return post_date >= cutoff_date
     except Exception as e:
@@ -255,7 +310,7 @@ def is_post_within_days(post_data, days_back):
 
 
 def get_community_posts(community_id, days_back):
-    """Get all posts from a community within the specified time range"""
+    """Get all posts from a community within the specified time range using new API"""
     print(f"Fetching community posts for {community_id}")
 
     posts = []
@@ -266,71 +321,48 @@ def get_community_posts(community_id, days_back):
     while page < max_pages:
         page += 1
 
-        params = f"communityId={community_id}&searchType=Default&rankingMode=Recency&count=1000"
+        params = {"community_id": community_id}
         if cursor:
-            params += f"&cursor={cursor}"
+            params["cursor"] = cursor
 
-        response = make_request("/community-tweets", params)
+        response = make_request("/twitter/community/tweets", params)
 
         if not response:
+            break
+
+        # Check API response status
+        if response.get("status") != "success":
+            print(f"❌ API error: {response.get('msg', 'Unknown error')}")
             break
 
         found_posts = False
 
         try:
-            if "result" in response and "timeline" in response["result"]:
-                timeline = response["result"]["timeline"]
-                if "instructions" in timeline:
-                    for instruction in timeline["instructions"]:
-                        if (
-                            instruction.get("type") == "TimelineAddEntries"
-                            and "entries" in instruction
-                        ):
-                            for entry in instruction["entries"]:
-                                entry_id = entry.get("entryId", "")
-                                if "tweet-" in entry_id:
-                                    entry_content = entry.get("content", {})
-                                    if (
-                                        "itemContent" in entry_content
-                                        and "tweet_results"
-                                        in entry_content["itemContent"]
-                                    ):
-                                        tweet_data = entry_content["itemContent"][
-                                            "tweet_results"
-                                        ].get("result", {})
+            # Extract tweets from new API format (inside data object)
+            data = response.get("data", {})
+            tweets = data.get("tweets", [])
 
-                                        # Check if within date range
-                                        if is_post_within_days(tweet_data, days_back):
-                                            post_info = extract_post_info(tweet_data)
-                                            if post_info:
-                                                posts.append(post_info)
-                                                found_posts = True
-                                        else:
-                                            return posts
-                                elif "tile-" in entry_id:
-                                    # Handle tile entries (like spaces/events) - skip them
-                                    continue
+            if not tweets:
+                break
 
-            # Look for cursor for next page
-            cursor = None
-            if "result" in response and "timeline" in response["result"]:
-                timeline = response["result"]["timeline"]
-                if "instructions" in timeline:
-                    for instruction in timeline["instructions"]:
-                        if instruction.get("type") == "TimelineAddEntries":
-                            entries = instruction.get("entries", [])
-                            for entry in entries:
-                                if entry.get("entryId", "").startswith(
-                                    "cursor-bottom-"
-                                ):
-                                    cursor_content = entry.get("content", {})
-                                    if "value" in cursor_content:
-                                        cursor = cursor_content["value"]
-                                        break
+            for tweet in tweets:
+                # Check if within date range
+                created_at = tweet.get("createdAt")
+                if is_post_within_days(created_at, days_back):
+                    post_info = extract_post_info(tweet)
+                    if post_info:
+                        posts.append(post_info)
+                        found_posts = True
+                else:
+                    # If we hit content outside date range, stop
+                    print(f"  Reached posts outside date range")
+                    return posts
 
-            # Also check for cursor at the top level
-            if not cursor and "cursor" in response and "bottom" in response["cursor"]:
-                cursor = response["cursor"]["bottom"]
+            # Check for next page
+            if response.get("has_next_page"):
+                cursor = response.get("next_cursor")
+            else:
+                cursor = None
 
             if not cursor or not found_posts:
                 break
@@ -340,48 +372,31 @@ def get_community_posts(community_id, days_back):
 
         except Exception as e:
             print(f"❌ Error on page {page}: {e}")
+            import traceback
+
+            traceback.print_exc()
             break
 
     print(f"✓ Found {len(posts)} community posts")
     return posts
 
 
-def extract_post_info(post_data):
-    """Extract relevant information from a post"""
+def extract_post_info(tweet):
+    """Extract relevant information from a post using new API format"""
     try:
-        # Handle TweetWithVisibilityResults wrapper for community tweets
-        if (
-            post_data.get("__typename") == "TweetWithVisibilityResults"
-            and "tweet" in post_data
-        ):
-            tweet_data = post_data["tweet"]
-        else:
-            tweet_data = post_data
-
-        # Extract legacy data and core data
-        if "legacy" in tweet_data:
-            legacy = tweet_data["legacy"]
-            core = tweet_data.get("core", {})
-        else:
-            return None
-
-        # Extract user data
-        user_data = {}
-        if "user_results" in core and "result" in core["user_results"]:
-            user_result = core["user_results"]["result"]
-            if "legacy" in user_result:
-                user_data = user_result["legacy"]
+        # New API has simpler structure
+        author = tweet.get("author", {})
 
         return {
-            "post_id": legacy.get("id_str", ""),
-            "text": legacy.get("full_text", ""),
-            "created_at": legacy.get("created_at", ""),
-            "user_id": legacy.get("user_id_str", ""),
-            "username": user_data.get("screen_name", ""),
-            "display_name": user_data.get("name", ""),
-            "retweet_count": legacy.get("retweet_count", 0),
-            "favorite_count": legacy.get("favorite_count", 0),
-            "reply_count": legacy.get("reply_count", 0),
+            "post_id": tweet.get("id", ""),
+            "text": tweet.get("text", ""),
+            "created_at": tweet.get("createdAt", ""),
+            "user_id": author.get("id", ""),
+            "username": author.get("userName", ""),
+            "display_name": author.get("name", ""),
+            "retweet_count": tweet.get("retweetCount", 0),
+            "favorite_count": tweet.get("likeCount", 0),
+            "reply_count": tweet.get("replyCount", 0),
         }
 
     except Exception as e:
@@ -943,8 +958,11 @@ def test_comment_extraction():
 
 
 def main():
-    """Main function - build comment graph from community posts"""
+    """Main function - build and analyze comment graph"""
     global rate_limiter, request_count, start_time
+
+    # Initialize to avoid unbound variable in exception handler
+    raw_data_dir = "./raw"
 
     try:
         # Load configuration
