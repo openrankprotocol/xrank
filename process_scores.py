@@ -19,7 +19,8 @@ Usage:
     python3 process_scores.py --sqrt       # Sqrt transformation only
     python3 process_scores.py --quantile   # Quantile transformation only
     python3 process_scores.py --sqrt --quantile  # Both sqrt and quantile transformations
-    python3 process_scores.py --members-only     # Filter to only community members
+    python3 process_scores.py --members-only     # Filter to only community members (excludes mods/admins)
+    python3 process_scores.py --members-and-mods # Filter to members, mods, and admins
 
 Requirements:
     - pandas (install with: pip install pandas)
@@ -131,22 +132,22 @@ def apply_quantile_transformation(df):
     return df_transformed
 
 
-def load_community_members(community_id, raw_dir="raw"):
+def load_community_data(community_id, raw_dir="raw"):
     """
-    Load community members from raw/[community_id]_members.json
+    Load community members and moderators from raw/[community_id]_members.json
 
     Args:
         community_id (str): Community ID
         raw_dir (str): Directory containing raw data files
 
     Returns:
-        set: Set of usernames who are community members
+        tuple: (set of member usernames, set of moderator usernames)
     """
     members_file = os.path.join(raw_dir, f"{community_id}_members.json")
 
     if not os.path.exists(members_file):
         print(f"    Warning: Members file not found: {members_file}")
-        return set()
+        return set(), set()
 
     try:
         with open(members_file, "r", encoding="utf-8") as f:
@@ -154,14 +155,25 @@ def load_community_members(community_id, raw_dir="raw"):
 
         # Extract usernames from members list
         members = data.get("members", [])
-        usernames = {member["username"] for member in members if "username" in member}
+        member_usernames = {
+            member["username"] for member in members if "username" in member
+        }
+        print(
+            f"    Loaded {len(member_usernames)} community members from {members_file}"
+        )
 
-        print(f"    Loaded {len(usernames)} community members from {members_file}")
-        return usernames
+        # Extract usernames from moderators list
+        moderators = data.get("moderators", [])
+        moderator_usernames = {
+            mod["username"] for mod in moderators if "username" in mod
+        }
+        print(f"    Loaded {len(moderator_usernames)} moderators from {members_file}")
+
+        return member_usernames, moderator_usernames
 
     except Exception as e:
         print(f"    Error loading members file: {e}")
-        return set()
+        return set(), set()
 
 
 def process_scores(
@@ -170,6 +182,7 @@ def process_scores(
     include_sqrt=False,
     include_quantile=False,
     members_only=False,
+    members_and_mods=False,
 ):
     """
     Process a single score file by applying transformations and saving
@@ -179,21 +192,33 @@ def process_scores(
         output_dir (str): Directory to save processed files
         include_sqrt (bool): Whether to include sqrt transformation
         include_quantile (bool): Whether to include quantile transformation
-        members_only (bool): Whether to filter to only community members
+        members_only (bool): Whether to filter to only community members (excludes mods/admins)
+        members_and_mods (bool): Whether to filter to members, mods, and admins
     """
     # Load the CSV file
     df = pd.read_csv(input_file)
 
     # Filter to community members if requested
-    if members_only:
+    if members_only or members_and_mods:
         community_id = Path(input_file).stem
-        member_usernames = load_community_members(community_id)
+        member_usernames, moderator_usernames = load_community_data(community_id)
 
-        if member_usernames:
+        if members_only:
+            # Only include members, exclude moderators
+            allowed_usernames = member_usernames - moderator_usernames
+            filter_description = "members only (excluding mods/admins)"
+        else:  # members_and_mods
+            # Include both members and moderators
+            allowed_usernames = member_usernames | moderator_usernames
+            filter_description = "members and mods/admins"
+
+        if allowed_usernames:
             original_count = len(df)
-            df = df[df["i"].isin(member_usernames)]
+            df = df[df["i"].isin(allowed_usernames)]
             filtered_count = len(df)
-            print(f"    Filtered to members: {filtered_count}/{original_count} users")
+            print(
+                f"    Filtered to {filter_description}: {filtered_count}/{original_count} users"
+            )
 
             # Normalize scores to sum to 1.0 after filtering
             if len(df) > 0:
@@ -272,7 +297,12 @@ def main():
     parser.add_argument(
         "--members-only",
         action="store_true",
-        help="Filter scores to only include community members from raw/[community_id]_members.json",
+        help="Filter scores to only include community members (excludes mods/admins) from raw/[community_id]_members.json",
+    )
+    parser.add_argument(
+        "--members-and-mods",
+        action="store_true",
+        help="Filter scores to include both community members and mods/admins from raw/[community_id]_members.json",
     )
     args = parser.parse_args()
 
@@ -307,7 +337,11 @@ def main():
 
     # Show member filtering status
     if args.members_only:
-        print("Member filtering: ENABLED (only community members will be included)")
+        print(
+            "Member filtering: ENABLED (only community members, excluding mods/admins)"
+        )
+    elif args.members_and_mods:
+        print("Member filtering: ENABLED (community members and mods/admins)")
     else:
         print("Member filtering: DISABLED (all users will be included)")
     print()
@@ -316,7 +350,12 @@ def main():
     for csv_file in csv_files:
         try:
             process_scores(
-                str(csv_file), output_dir, args.sqrt, args.quantile, args.members_only
+                str(csv_file),
+                output_dir,
+                args.sqrt,
+                args.quantile,
+                args.members_only,
+                args.members_and_mods,
             )
             print()
         except Exception as e:
