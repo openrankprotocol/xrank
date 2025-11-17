@@ -4,6 +4,7 @@ raw/**
 tmp/**
 output/**
 ui/**
-__pycache__/**
+__pycache__
+seed_graph/__pycache__
 
 .env

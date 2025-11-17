@@ -3,10 +3,10 @@
 Seed Users Interactions Fetcher
 
 This script fetches all interactions from users in the seed followings master list:
-1. Loads raw/seed_followings.json (created by fetch_seed_followings.py)
+1. Loads raw/{seed_user_id}_seed_followings.json (created by fetch_followings.py)
 2. Fetches all posts/tweets and replies from each user in the master list
 3. Applies days_back and post_limit from config.toml
-4. Saves the data to raw/seed_interactions.json
+4. Saves the data to raw/{seed_user_id}_seed_interactions.json
 
 Uses endpoints:
 - /twitter/user/last_tweets for user timeline posts (includes original posts, retweets, quotes, and replies)
@@ -60,7 +60,11 @@ start_time = None
 def load_config():
     """Load configuration from config.toml"""
     try:
-        with open("config.toml", "r") as f:
+        # Get the directory where this script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Config is in the parent directory
+        config_path = os.path.join(script_dir, "..", "config.toml")
+        with open(config_path, "r") as f:
             return toml.load(f)
     except FileNotFoundError:
         print("Error: config.toml not found")
@@ -177,13 +181,55 @@ def make_request(endpoint, params=None, max_retries=3):
 
 
 def load_seed_followings(raw_data_dir):
-    """Load the seed followings master list"""
-    filename = os.path.join(raw_data_dir, "seed_followings.json")
+    """Load the seed followings master list for the active seed user from config"""
+    # Load config to get active seed username
+    config = load_config()
+    if not config:
+        return None, None
 
-    if not os.path.exists(filename):
-        print(f"Error: Seed followings file not found: {filename}")
-        print("Please run fetch_seed_followings.py first to generate the master list.")
-        return None
+    # Get active seed usernames (first non-commented one)
+    seed_usernames = config.get("seed_users", {}).get("usernames", [])
+    seed_usernames = [u for u in seed_usernames if u and not u.startswith("#")]
+
+    if not seed_usernames:
+        print(
+            "Error: No active seed username found in config.toml [seed_users] section"
+        )
+        print("Please uncomment a username in config.toml")
+        return None, None
+
+    active_username = seed_usernames[0]
+    print(f"Using active seed user: @{active_username}")
+
+    # Try to find the seed_followings file by searching for files with this username
+    # We need to check all *_seed_followings.json files to find the one with matching username
+    import glob
+
+    pattern = os.path.join(raw_data_dir, "*_seed_followings.json")
+    matching_files = glob.glob(pattern)
+
+    filename = None
+    for file_path in matching_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                seed_users = data.get("seed_users", [])
+                # Check if this file contains our active seed user
+                for seed_user in seed_users:
+                    if seed_user.get("username", "").lower() == active_username.lower():
+                        filename = file_path
+                        break
+                if filename:
+                    break
+        except:
+            continue
+
+    if not filename:
+        print(f"Error: Seed followings file not found for @{active_username}")
+        print(
+            f"Please run fetch_followings.py first with @{active_username} in config.toml"
+        )
+        return None, None
 
     try:
         with open(filename, "r", encoding="utf-8") as f:
@@ -192,15 +238,19 @@ def load_seed_followings(raw_data_dir):
         master_list = data.get("master_list", [])
         seed_users = data.get("seed_users", [])
 
+        # Extract seed_user_id from filename
+        seed_user_id = os.path.basename(filename).split("_seed_followings.json")[0]
+
         print(f"Loaded seed followings from {filename}")
+        print(f"  - Seed user ID: {seed_user_id}")
         print(f"  - Seed users: {len(seed_users)}")
         print(f"  - Total users in master list: {len(master_list)}")
 
-        return master_list
+        return master_list, seed_user_id
 
     except Exception as e:
         print(f"Error loading seed followings: {e}")
-        return None
+        return None, None
 
 
 def is_post_within_days(created_at_str, days_back):
@@ -246,9 +296,14 @@ def is_post_within_days(created_at_str, days_back):
 
 def extract_post_data(tweet):
     """Extract relevant data from a tweet using new API format"""
+    if not tweet or not isinstance(tweet, dict):
+        return None
+
     try:
         # New API format is much simpler
         author = tweet.get("author", {})
+        if not isinstance(author, dict):
+            author = {}
 
         # Determine post type
         is_reply = tweet.get("isReply", False)
@@ -344,11 +399,18 @@ def get_user_tweets(username, user_id, days_back, max_tweets=1000):
         response = make_request("/twitter/user/last_tweets", params)
 
         if not response:
+            print(f"    No response from API for @{username}")
             break
 
         # Check API response status
-        if response.get("status") != "success":
-            print(f"    API error: {response.get('message', 'Unknown error')}")
+        status = response.get("status") if isinstance(response, dict) else None
+        if status != "success":
+            message = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Invalid response format"
+            )
+            print(f"    API error: {message}")
             break
 
         # Extract tweets from new API format (inside data object)
@@ -356,7 +418,15 @@ def get_user_tweets(username, user_id, days_back, max_tweets=1000):
 
         try:
             # Tweets are nested inside data object
-            data = response.get("data", {})
+            if not isinstance(response, dict):
+                print(f"    Invalid response type for @{username}: {type(response)}")
+                break
+
+            data = response.get("data")
+            if not data or not isinstance(data, dict):
+                print(f"    No data in response for @{username}")
+                break
+
             tweets = data.get("tweets", [])
 
             if not tweets:
@@ -377,7 +447,9 @@ def get_user_tweets(username, user_id, days_back, max_tweets=1000):
                     return content
 
         except Exception as e:
-            print(f"    Error parsing response for @{username}: {e}")
+            print(
+                f"    Error parsing response for @{username}: {type(e).__name__}: {e}"
+            )
             break
 
         if not found_content:
@@ -439,9 +511,11 @@ def fetch_user_interactions(user, days_back, post_limit):
     return user_data
 
 
-def save_checkpoint(users_interactions, raw_data_dir):
+def save_checkpoint(users_interactions, raw_data_dir, seed_user_id):
     """Save checkpoint to allow resuming"""
-    checkpoint_file = os.path.join(raw_data_dir, "seed_interactions_checkpoint.json")
+    checkpoint_file = os.path.join(
+        raw_data_dir, f"{seed_user_id}_seed_interactions_checkpoint.json"
+    )
     os.makedirs(raw_data_dir, exist_ok=True)
 
     try:
@@ -452,9 +526,11 @@ def save_checkpoint(users_interactions, raw_data_dir):
         print(f"  Warning: Could not save checkpoint: {e}")
 
 
-def load_checkpoint(raw_data_dir):
+def load_checkpoint(raw_data_dir, seed_user_id):
     """Load checkpoint if exists"""
-    checkpoint_file = os.path.join(raw_data_dir, "seed_interactions_checkpoint.json")
+    checkpoint_file = os.path.join(
+        raw_data_dir, f"{seed_user_id}_seed_interactions_checkpoint.json"
+    )
 
     if not os.path.exists(checkpoint_file):
         return []
@@ -467,9 +543,11 @@ def load_checkpoint(raw_data_dir):
         return []
 
 
-def cleanup_checkpoint(raw_data_dir):
+def cleanup_checkpoint(raw_data_dir, seed_user_id):
     """Remove checkpoint file after successful completion"""
-    checkpoint_file = os.path.join(raw_data_dir, "seed_interactions_checkpoint.json")
+    checkpoint_file = os.path.join(
+        raw_data_dir, f"{seed_user_id}_seed_interactions_checkpoint.json"
+    )
 
     try:
         if os.path.exists(checkpoint_file):
@@ -488,9 +566,9 @@ def get_processed_usernames(processed_users):
     }
 
 
-def save_interactions_data(users_interactions, raw_data_dir):
+def save_interactions_data(users_interactions, raw_data_dir, seed_user_id):
     """Save interactions data to JSON file"""
-    filename = os.path.join(raw_data_dir, "seed_interactions.json")
+    filename = os.path.join(raw_data_dir, f"{seed_user_id}_seed_interactions.json")
     os.makedirs(raw_data_dir, exist_ok=True)
 
     # Organize data by user type
@@ -553,7 +631,11 @@ def main():
         print(f"Max parallel users: {max_parallel}")
         print(f"=" * 60)
 
-        raw_data_dir = config.get("output", {}).get("raw_data_dir", "./raw")
+        # Get raw_data_dir and make it relative to project root
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.join(script_dir, "..")
+        raw_data_dir_config = config.get("output", {}).get("raw_data_dir", "./raw")
+        raw_data_dir = os.path.join(project_root, raw_data_dir_config.lstrip("./"))
         days_back = config.get("data", {}).get("days_back", 365)
         post_limit_per_user = config.get("data", {}).get("post_limit_per_user", 500)
 
@@ -563,14 +645,14 @@ def main():
         print(f"  - Raw data directory: {raw_data_dir}")
 
         # Load seed followings master list
-        master_list = load_seed_followings(raw_data_dir)
-        if not master_list:
+        master_list, seed_user_id = load_seed_followings(raw_data_dir)
+        if not master_list or not seed_user_id:
             print("Error: Could not load seed followings")
             return
 
         # Load checkpoint if exists
-        processed_users = load_checkpoint(raw_data_dir)
-        processed_usernames = get_processed_usernames(processed_users)
+        processed_data = load_checkpoint(raw_data_dir, seed_user_id)
+        processed_usernames = get_processed_usernames(processed_data)
 
         # Filter out already processed users
         remaining_users = [
@@ -580,11 +662,11 @@ def main():
         ]
 
         print(f"\nTotal users in master list: {len(master_list)}")
-        print(f"Already processed: {len(processed_users)}")
+        print(f"Already processed: {len(processed_data)}")
         print(f"Remaining to process: {len(remaining_users)}")
 
         # Start with existing processed users
-        users_interactions = processed_users.copy()
+        users_interactions = processed_data.copy()
 
         # Process remaining users in parallel batches
         batch_size = max_parallel
@@ -622,16 +704,17 @@ def main():
                         continue
 
             # Save checkpoint after each batch
-            save_checkpoint(users_interactions, raw_data_dir)
+            save_checkpoint(users_interactions, raw_data_dir, seed_user_id)
             print(
                 f"Progress: {len(users_interactions)}/{len(master_list)} users processed"
             )
 
         # Save interactions data
+        # Save final results
         if users_interactions:
-            save_interactions_data(users_interactions, raw_data_dir)
+            save_interactions_data(users_interactions, raw_data_dir, seed_user_id)
             # Clean up checkpoint file after successful completion
-            cleanup_checkpoint(raw_data_dir)
+            cleanup_checkpoint(raw_data_dir, seed_user_id)
         else:
             print(f"No interactions data collected")
 
@@ -649,7 +732,7 @@ def main():
             print(f"- Average rate: {avg_rate:.2f} requests/second")
 
         print(f"\nOutput file saved in {raw_data_dir}:")
-        print(f"- seed_interactions.json")
+        print(f"- {seed_user_id}_seed_interactions.json")
 
     except Exception as e:
         print(f"Error: {str(e)}")
