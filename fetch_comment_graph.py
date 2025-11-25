@@ -338,9 +338,8 @@ def get_community_posts(community_id, days_back):
         found_posts = False
 
         try:
-            # Extract tweets from new API format (inside data object)
-            data = response.get("data", {})
-            tweets = data.get("tweets", [])
+            # Extract tweets from new API format (tweets are at top level)
+            tweets = response.get("tweets", [])
 
             if not tweets:
                 break
