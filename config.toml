@@ -16,12 +16,12 @@ post_limit_per_user = 500
 [communities]
 # List of community IDs to fetch from
 ids = [
-    # "1917017448341246418", # EigenTribe
+    "1917017448341246418", # EigenTribe
     "1896991026272723220", # Ritual
-    # "1884047066877550776", # MegaETH
-    # "1872222575180546208", # Story
-    # "1920364230756479110", # Aztec
-    # "1966141414703509919", # Sentient
+    "1884047066877550776", # MegaETH
+    "1872222575180546208", # Story
+    "1920364230756479110", # Aztec
+    "1966141414703509919", # Sentient
 ]
 
 [seed_users]

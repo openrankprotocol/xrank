@@ -586,9 +586,7 @@ def process_single_user(user, master_user_ids, user_id_to_username, index, total
         following_in_master = []
         for following_id in following_ids:
             if following_id in master_user_ids:
-                following_username = user_id_to_username.get(following_id)
-                if following_username:
-                    following_in_master.append(following_username)
+                following_in_master.append(following_id)
 
         # Add to network
         user_network = {
