@@ -2,7 +2,7 @@
 
 [data]
 # Number of days to go back for fetching posts
-days_back = 90
+days_back = 365
 
 # Maximum posts per community (0 = unlimited)
 post_limit = 10000

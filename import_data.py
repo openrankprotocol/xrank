@@ -8,6 +8,10 @@ Imports data from the following JSON files:
 - {community_id}_comment_graph.json -> interactions table
 - {community_id}_members_interactions.json -> interactions table
 
+Imports data from CSV files:
+- scores/{community_id}.csv -> runs, scores tables
+- seed/{community_id}.csv -> seed table
+
 Usage:
     python3 import_data.py                           # Import all communities
     python3 import_data.py --community 123456        # Import specific community
@@ -22,6 +26,7 @@ Database schema:
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -30,6 +35,7 @@ from pathlib import Path
 from typing import Optional
 
 import psycopg2
+import toml
 from dotenv import load_dotenv
 from psycopg2.extras import execute_values
 
@@ -751,7 +757,151 @@ def process_members_interactions_file(conn, file_path: Path, dry_run: bool = Fal
     return len(users_data), len(interactions_data)
 
 
-def import_community(conn, community_id: str, files: dict, dry_run: bool = False):
+def process_scores_file(
+    conn, file_path: Path, community_id: int, run_id: int, dry_run: bool = False
+):
+    """Process a scores CSV file and import into scores table."""
+    print(f"  📂 Loading scores from: {file_path.name}")
+
+    scores_data = []
+    with open(file_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            user_id = row.get("i")
+            score = row.get("v")
+            if user_id and score:
+                scores_data.append((community_id, run_id, int(user_id), float(score)))
+
+    print(f"  📊 Found {len(scores_data)} scores")
+
+    if dry_run:
+        print(f"  🔍 Dry run - no data inserted")
+        return len(scores_data)
+
+    cursor = conn.cursor()
+
+    try:
+        if scores_data:
+            print(f"  💾 Inserting scores...")
+            execute_values(
+                cursor,
+                """
+                INSERT INTO xrank.scores (community_id, run_id, user_id, score)
+                VALUES %s
+                ON CONFLICT (community_id, run_id, user_id) DO UPDATE SET
+                    score = EXCLUDED.score
+                """,
+                scores_data,
+                page_size=1000,
+            )
+
+        conn.commit()
+        print(f"  ✅ Imported {len(scores_data)} scores")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"  ❌ Error importing scores: {e}")
+        raise
+    finally:
+        cursor.close()
+
+    return len(scores_data)
+
+
+def process_seed_file(
+    conn, file_path: Path, community_id: int, run_id: int, dry_run: bool = False
+):
+    """Process a seed CSV file and import into seed table."""
+    print(f"  📂 Loading seed from: {file_path.name}")
+
+    seed_data = []
+    with open(file_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            user_id = row.get("i")
+            score = row.get("v")
+            if user_id and score:
+                seed_data.append((community_id, run_id, int(user_id), float(score)))
+
+    print(f"  📊 Found {len(seed_data)} seed users")
+
+    if dry_run:
+        print(f"  🔍 Dry run - no data inserted")
+        return len(seed_data)
+
+    cursor = conn.cursor()
+
+    try:
+        if seed_data:
+            print(f"  💾 Inserting seed users...")
+            execute_values(
+                cursor,
+                """
+                INSERT INTO xrank.seeds (community_id, run_id, user_id, score)
+                VALUES %s
+                ON CONFLICT (community_id, run_id, user_id) DO UPDATE SET
+                    score = EXCLUDED.score
+                """,
+                seed_data,
+                page_size=1000,
+            )
+
+        conn.commit()
+        print(f"  ✅ Imported {len(seed_data)} seed users")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"  ❌ Error importing seed: {e}")
+        raise
+    finally:
+        cursor.close()
+
+    return len(seed_data)
+
+
+def create_run(conn, community_id: str, days_back: int, dry_run: bool = False):
+    """Create a new run entry and return the run_id (per-community incrementing)."""
+    if dry_run:
+        print(f"  🔍 Dry run - would create run for community {community_id}")
+        return None
+
+    cursor = conn.cursor()
+
+    try:
+        # Get the next run_id for this community
+        cursor.execute(
+            """
+            SELECT COALESCE(MAX(run_id), 0) + 1
+            FROM xrank.runs
+            WHERE community_id = %s
+            """,
+            (int(community_id),),
+        )
+        run_id = cursor.fetchone()[0]
+
+        # Insert the new run
+        cursor.execute(
+            """
+            INSERT INTO xrank.runs (community_id, run_id, days_back)
+            VALUES (%s, %s, %s)
+            """,
+            (int(community_id), run_id, days_back),
+        )
+        conn.commit()
+        print(f"  ✅ Created run {run_id} for community {community_id}")
+        return run_id
+
+    except Exception as e:
+        conn.rollback()
+        print(f"  ❌ Error creating run: {e}")
+        raise
+    finally:
+        cursor.close()
+
+
+def import_community(
+    conn, community_id: str, files: dict, days_back: int, dry_run: bool = False
+):
     """
     Import all data for a single community.
 
@@ -759,6 +909,7 @@ def import_community(conn, community_id: str, files: dict, dry_run: bool = False
         conn: Database connection
         community_id: Community ID
         files: Dict of file_type -> file_path
+        days_back: Number of days of data used (from config)
         dry_run: If True, don't actually insert data
 
     Returns:
@@ -769,6 +920,8 @@ def import_community(conn, community_id: str, files: dict, dry_run: bool = False
         "memberships": 0,
         "followings": 0,
         "interactions": 0,
+        "scores": 0,
+        "seed": 0,
     }
 
     # Process in order: members first (to establish users), then others
@@ -802,6 +955,43 @@ def import_community(conn, community_id: str, files: dict, dry_run: bool = False
         counts["interactions"] += interactions
         print()
 
+    # Import scores and seed if available
+    if "scores" in files or "seed" in files:
+        print("📊 Importing scores and seed data...")
+
+        # Ensure community exists before creating run (foreign key constraint)
+        if not dry_run:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO xrank.communities (community_id, updated_at)
+                    VALUES (%s, CURRENT_TIMESTAMP)
+                    ON CONFLICT(community_id) DO UPDATE SET
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (int(community_id),),
+                )
+                conn.commit()
+            finally:
+                cursor.close()
+
+        run_id = create_run(conn, community_id, days_back, dry_run)
+
+        if "scores" in files and run_id:
+            scores_count = process_scores_file(
+                conn, files["scores"], int(community_id), run_id, dry_run
+            )
+            counts["scores"] += scores_count
+            print()
+
+        if "seed" in files and run_id:
+            seed_count = process_seed_file(
+                conn, files["seed"], int(community_id), run_id, dry_run
+            )
+            counts["seed"] += seed_count
+            print()
+
     return counts
 
 
@@ -831,9 +1021,24 @@ def main():
 
     print("📥 Import X/Twitter Data to PostgreSQL\n")
 
-    # Resolve paths relative to script directory
+    # Load config for days_back
     script_dir = Path(__file__).parent
+    config_path = script_dir / "config.toml"
+    days_back = 365  # default
+    if config_path.exists():
+        try:
+            config = toml.load(config_path)
+            days_back = config.get("data", {}).get("days_back", 365)
+            print(f"📅 Using days_back={days_back} from config.toml")
+        except Exception as e:
+            print(f"⚠️  Could not load config.toml: {e}, using default days_back=365")
+    else:
+        print(f"⚠️  config.toml not found, using default days_back=365")
+
+    # Resolve paths relative to script directory
     raw_dir = script_dir / args.raw
+    scores_dir = script_dir / "scores"
+    seed_dir = script_dir / "seed"
 
     if not raw_dir.exists():
         print(f"❌ Error: Raw data directory not found: {raw_dir}")
@@ -863,6 +1068,28 @@ def main():
             communities[comm_id] = {}
         communities[comm_id][file_type] = file_path
 
+    # Add scores files
+    if scores_dir.exists():
+        for file_path in sorted(scores_dir.glob("*.csv")):
+            comm_id = file_path.stem
+            if args.community and comm_id != args.community:
+                continue
+            if comm_id not in communities:
+                communities[comm_id] = {}
+            communities[comm_id]["scores"] = file_path
+
+    # Add seed files
+    if seed_dir.exists():
+        for file_path in sorted(seed_dir.glob("*.csv")):
+            comm_id = file_path.stem
+            if args.community and comm_id != args.community:
+                continue
+            if comm_id == "seed_graph":
+                continue  # Skip seed_graph.csv
+            if comm_id not in communities:
+                communities[comm_id] = {}
+            communities[comm_id]["seed"] = file_path
+
     if not communities:
         if args.community:
             print(f"❌ Error: No files found for community {args.community}")
@@ -890,6 +1117,8 @@ def main():
         "memberships": 0,
         "followings": 0,
         "interactions": 0,
+        "scores": 0,
+        "seed": 0,
     }
 
     try:
@@ -898,7 +1127,9 @@ def main():
             print(f"Community: {comm_id}")
             print(f"{'=' * 60}")
 
-            counts = import_community(conn, comm_id, files, dry_run=args.dry_run)
+            counts = import_community(
+                conn, comm_id, files, days_back=days_back, dry_run=args.dry_run
+            )
 
             for key in total_counts:
                 total_counts[key] += counts[key]
@@ -914,6 +1145,8 @@ def main():
     print(f"   Total memberships: {total_counts['memberships']}")
     print(f"   Total followings: {total_counts['followings']}")
     print(f"   Total interactions: {total_counts['interactions']}")
+    print(f"   Total scores: {total_counts['scores']}")
+    print(f"   Total seed users: {total_counts['seed']}")
     if args.dry_run:
         print("   (Dry run - no data was inserted)")
     print()
