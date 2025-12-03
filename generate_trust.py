@@ -16,10 +16,7 @@ Interaction types and their sources:
 - retweet: from members interactions (retweet posts)
 - quote: from members interactions (quote posts)
 
-Weight Multipliers:
-- Interactions happening inside the community (is_community_post=True) receive 2x weight
-- Comment graph interactions are always considered community interactions (2x weight)
-
+Note: All user references are by user_id (not username).
 Note: Comments from comment_graph.json are treated as reply interactions since they represent the same behavior.
 """
 
@@ -81,8 +78,31 @@ def extract_mentions(text):
     return [normalize_username(mention) for mention in mentions]
 
 
+def build_username_to_id_lookup(members_data, following_data=None):
+    """Build a lookup dictionary from username to user_id"""
+    username_to_id = {}
+
+    # Add from members_interactions
+    if members_data and "members_interactions" in members_data:
+        for member in members_data["members_interactions"]:
+            user_id = str(member.get("user_id", ""))
+            username = normalize_username(member.get("username", ""))
+            if user_id and username:
+                username_to_id[username] = user_id
+
+    # Add from following_network
+    if following_data and "following_network" in following_data:
+        for user in following_data["following_network"]:
+            user_id = str(user.get("user_id", ""))
+            username = normalize_username(user.get("username", ""))
+            if user_id and username:
+                username_to_id[username] = user_id
+
+    return username_to_id
+
+
 def process_following_network(following_data, trust_weights):
-    """Process following network to extract follow relationships"""
+    """Process following network to extract follow relationships using user_ids"""
     interactions = []
     if not following_data or "following_network" not in following_data:
         return interactions
@@ -92,19 +112,19 @@ def process_following_network(following_data, trust_weights):
 
     follow_count = 0
     for user in following_data["following_network"]:
-        follower = normalize_username(user.get("username", ""))
-        if not follower:
+        follower_id = str(user.get("user_id", ""))
+        if not follower_id:
             continue
 
         following_list = user.get("following", [])
-        for followed_user in following_list:
-            followed = normalize_username(followed_user)
-            if followed and follower != followed:
+        for followed_user_id in following_list:
+            followed_id = str(followed_user_id)
+            if followed_id and follower_id != followed_id:
                 interactions.append(
                     {
                         "type": "follow",
-                        "source": follower,
-                        "target": followed,
+                        "source": follower_id,
+                        "target": followed_id,
                         "weight": follow_weight,
                     }
                 )
@@ -114,8 +134,10 @@ def process_following_network(following_data, trust_weights):
     return interactions
 
 
-def process_members_interactions(members_data, trust_weights):
-    """Process member interactions to extract various interaction types"""
+def process_members_interactions(
+    members_data, trust_weights, username_to_id, community_id
+):
+    """Process member interactions to extract various interaction types using user_ids"""
     interactions = []
     if not members_data or "members_interactions" not in members_data:
         return interactions
@@ -129,14 +151,16 @@ def process_members_interactions(members_data, trust_weights):
     print(
         f"    Weights: mention={mention_weight}, reply={reply_weight}, retweet={retweet_weight}, quote={quote_weight}"
     )
-    print(f"    Community posts receive 2x weight multiplier")
+    print(
+        f"    Community posts (community_id={community_id}) receive 2x weight multiplier"
+    )
 
     interaction_counts = defaultdict(int)
     community_interaction_counts = defaultdict(int)
 
     for member in members_data["members_interactions"]:
-        member_username = normalize_username(member.get("username", ""))
-        if not member_username:
+        member_user_id = str(member.get("user_id", ""))
+        if not member_user_id:
             continue
 
         posts = member.get("posts", [])
@@ -145,77 +169,131 @@ def process_members_interactions(members_data, trust_weights):
             is_reply = post.get("is_reply", False)
             is_retweet = post.get("is_retweet", False)
             is_quote = post.get("is_quote", False)
-            is_community_post = post.get("is_community_post", False)
-            reply_to_username = normalize_username(post.get("reply_to_username", ""))
 
-            # Apply 2x multiplier for community posts
+            # Check if post is within the community being processed
+            post_community_id = post.get("community_id")
+            is_community_post = (
+                str(post_community_id) == str(community_id)
+                if post_community_id
+                else False
+            )
             weight_multiplier = 2.0 if is_community_post else 1.0
 
             # Process retweets
             if is_retweet:
-                original_creator = normalize_username(
-                    post.get("original_post_creator_username", "")
-                )
-                if original_creator and member_username != original_creator:
-                    interactions.append(
-                        {
-                            "type": "retweet",
-                            "source": member_username,
-                            "target": original_creator,
-                            "weight": retweet_weight * weight_multiplier,
-                        }
-                    )
-                    interaction_counts["retweet"] += 1
-                    if is_community_post:
-                        community_interaction_counts["retweet"] += 1
+                original_creator_id = post.get("original_post_creator_id")
+                if original_creator_id:
+                    original_creator_id = str(original_creator_id)
+                    if original_creator_id and member_user_id != original_creator_id:
+                        interactions.append(
+                            {
+                                "type": "retweet",
+                                "source": member_user_id,
+                                "target": original_creator_id,
+                                "weight": retweet_weight * weight_multiplier,
+                            }
+                        )
+                        interaction_counts["retweet"] += 1
+                        if is_community_post:
+                            community_interaction_counts["retweet"] += 1
 
             # Process quotes
             elif is_quote:
-                original_creator = normalize_username(
-                    post.get("original_post_creator_username", "")
-                )
-                if original_creator and member_username != original_creator:
-                    interactions.append(
-                        {
-                            "type": "quote",
-                            "source": member_username,
-                            "target": original_creator,
-                            "weight": quote_weight * weight_multiplier,
-                        }
-                    )
-                    interaction_counts["quote"] += 1
-                    if is_community_post:
-                        community_interaction_counts["quote"] += 1
+                original_creator_id = post.get("original_post_creator_id")
+                if original_creator_id:
+                    original_creator_id = str(original_creator_id)
+                    if original_creator_id and member_user_id != original_creator_id:
+                        interactions.append(
+                            {
+                                "type": "quote",
+                                "source": member_user_id,
+                                "target": original_creator_id,
+                                "weight": quote_weight * weight_multiplier,
+                            }
+                        )
+                        interaction_counts["quote"] += 1
+                        if is_community_post:
+                            community_interaction_counts["quote"] += 1
 
             # Process replies
-            elif is_reply and reply_to_username:
-                if member_username != reply_to_username:
-                    interactions.append(
-                        {
-                            "type": "reply",
-                            "source": member_username,
-                            "target": reply_to_username,
-                            "weight": reply_weight * weight_multiplier,
-                        }
-                    )
-                    interaction_counts["reply"] += 1
-                    if is_community_post:
-                        community_interaction_counts["reply"] += 1
+            elif is_reply:
+                reply_to_user_id = post.get("reply_to_user_id")
+                if reply_to_user_id:
+                    reply_to_user_id = str(reply_to_user_id)
+                    if reply_to_user_id and member_user_id != reply_to_user_id:
+                        interactions.append(
+                            {
+                                "type": "reply",
+                                "source": member_user_id,
+                                "target": reply_to_user_id,
+                                "weight": reply_weight * weight_multiplier,
+                            }
+                        )
+                        interaction_counts["reply"] += 1
+                        if is_community_post:
+                            community_interaction_counts["reply"] += 1
 
-            # Process mentions in post text
+            # Process mentions in post text (need to convert username to user_id)
             mentions = extract_mentions(post_text)
-            for mentioned_user in mentions:
-                if mentioned_user and member_username != mentioned_user:
+            for mentioned_username in mentions:
+                mentioned_user_id = username_to_id.get(mentioned_username)
+                if mentioned_user_id and mentioned_user_id != member_user_id:
                     interactions.append(
                         {
                             "type": "mention",
-                            "source": member_username,
-                            "target": mentioned_user,
+                            "source": member_user_id,
+                            "target": mentioned_user_id,
                             "weight": mention_weight * weight_multiplier,
                         }
                     )
                     interaction_counts["mention"] += 1
                     if is_community_post:
+                        community_interaction_counts["mention"] += 1
+
+        # Process replies from member's replies list
+        replies = member.get("replies", [])
+        for reply in replies:
+            # Check if reply is within the community being processed
+            reply_community_id = reply.get("community_id")
+            is_reply_community_post = (
+                str(reply_community_id) == str(community_id)
+                if reply_community_id
+                else False
+            )
+            reply_weight_multiplier = 2.0 if is_reply_community_post else 1.0
+
+            reply_to_user_id = reply.get("reply_to_user_id")
+            if reply_to_user_id:
+                reply_to_user_id = str(reply_to_user_id)
+                if reply_to_user_id and member_user_id != reply_to_user_id:
+                    interactions.append(
+                        {
+                            "type": "reply",
+                            "source": member_user_id,
+                            "target": reply_to_user_id,
+                            "weight": reply_weight * reply_weight_multiplier,
+                        }
+                    )
+                    interaction_counts["reply"] += 1
+                    if is_reply_community_post:
+                        community_interaction_counts["reply"] += 1
+
+            # Process mentions in reply text
+            reply_text = reply.get("text", "")
+            mentions = extract_mentions(reply_text)
+            for mentioned_username in mentions:
+                mentioned_user_id = username_to_id.get(mentioned_username)
+                if mentioned_user_id and mentioned_user_id != member_user_id:
+                    interactions.append(
+                        {
+                            "type": "mention",
+                            "source": member_user_id,
+                            "target": mentioned_user_id,
+                            "weight": mention_weight * reply_weight_multiplier,
+                        }
+                    )
+                    interaction_counts["mention"] += 1
+                    if is_reply_community_post:
                         community_interaction_counts["mention"] += 1
 
     for interaction_type, count in interaction_counts.items():
@@ -227,29 +305,14 @@ def process_members_interactions(members_data, trust_weights):
     return interactions
 
 
-def build_user_lookup(members_data):
-    """Build a lookup dictionary from user_id to username"""
-    user_lookup = {}
-
-    # Add members
-    if members_data and "members_interactions" in members_data:
-        for member in members_data["members_interactions"]:
-            user_id = member.get("user_id", "")
-            username = normalize_username(member.get("username", ""))
-            if user_id and username:
-                user_lookup[user_id] = username
-
-    return user_lookup
-
-
-def process_comment_graph(comment_data, trust_weights, user_lookup=None):
-    """Process comment graph to extract comment interactions"""
+def process_comment_graph(comment_data, trust_weights):
+    """Process comment graph to extract comment interactions using user_ids"""
     interactions = []
     if not comment_data or "comment_graph" not in comment_data:
         return interactions
 
     reply_weight = trust_weights.get("reply", 20)  # Use reply weight for comments
-    # Comments are always community interactions, so apply 2x multiplier
+    # Comment graph interactions are always community interactions, so apply 2x multiplier
     comment_weight = reply_weight * 2.0
     print(
         f"  Processing comment graph as replies with weight {reply_weight} (2x = {comment_weight} for community)"
@@ -259,35 +322,29 @@ def process_comment_graph(comment_data, trust_weights, user_lookup=None):
     skipped_count = 0
 
     for comment in comment_data["comment_graph"]:
-        commenter_username = normalize_username(comment.get("commenter_username", ""))
-        original_author_username = normalize_username(
-            comment.get("original_post_author_username", "")
-        )
+        commenter_user_id = comment.get("commenter_user_id")
+        original_author_user_id = comment.get("original_post_author_id")
 
-        # If commenter_username is empty, try to look it up by user_id
-        if not commenter_username and user_lookup:
-            commenter_user_id = comment.get("commenter_user_id", "")
-            if commenter_user_id in user_lookup:
-                commenter_username = user_lookup[commenter_user_id]
-
-        # Skip if we still don't have both usernames or they're the same
-        if not commenter_username or not original_author_username:
+        if not commenter_user_id or not original_author_user_id:
             skipped_count += 1
             continue
 
-        if commenter_username != original_author_username:
+        commenter_user_id = str(commenter_user_id)
+        original_author_user_id = str(original_author_user_id)
+
+        if commenter_user_id != original_author_user_id:
             interactions.append(
                 {
                     "type": "reply",
-                    "source": commenter_username,
-                    "target": original_author_username,
+                    "source": commenter_user_id,
+                    "target": original_author_user_id,
                     "weight": comment_weight,
                 }
             )
             comment_count += 1
 
     print(
-        f"    Found {comment_count} reply interactions from comments, skipped {skipped_count} due to missing usernames"
+        f"    Found {comment_count} reply interactions from comments, skipped {skipped_count} due to missing user_ids"
     )
     return interactions
 
@@ -383,6 +440,10 @@ def process_community(community_id, raw_data_dir, trust_dir, trust_weights):
 
     print(f"🔄 Processing interactions...")
 
+    # Build username to user_id lookup for mention processing
+    username_to_id = build_username_to_id_lookup(members_data, following_data)
+    print(f"  Built username->user_id lookup with {len(username_to_id)} entries")
+
     # Process each data source
     all_interactions = []
 
@@ -393,16 +454,13 @@ def process_community(community_id, raw_data_dir, trust_dir, trust_weights):
         all_interactions.extend(following_interactions)
 
     if members_data:
-        members_interactions = process_members_interactions(members_data, trust_weights)
+        members_interactions = process_members_interactions(
+            members_data, trust_weights, username_to_id, community_id
+        )
         all_interactions.extend(members_interactions)
 
     if comment_data:
-        # Build user lookup for comment processing
-        user_lookup = build_user_lookup(members_data)
-        print(f"  Built user lookup with {len(user_lookup)} entries")
-        comment_interactions = process_comment_graph(
-            comment_data, trust_weights, user_lookup
-        )
+        comment_interactions = process_comment_graph(comment_data, trust_weights)
         all_interactions.extend(comment_interactions)
 
     if not all_interactions:
