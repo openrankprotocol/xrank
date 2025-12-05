@@ -92,18 +92,20 @@ def process_members_file(conn, file_path: Path, dry_run: bool = False):
         community_description = data.get("community_description")
         community_created_at = data.get("community_created_at")
         creator = data.get("creator", {})
-        creator_username = creator.get("username") if creator else None
+        creator_id = (
+            int(creator.get("user_id")) if creator and creator.get("user_id") else None
+        )
 
         # Insert/update community with metadata
         cursor.execute(
             """
-            INSERT INTO xrank.communities (community_id, name, description, created_at, creator_username, updated_at)
+            INSERT INTO xrank.communities (community_id, name, description, created_at, creator_id, updated_at)
             VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             ON CONFLICT(community_id) DO UPDATE SET
                 name = COALESCE(EXCLUDED.name, xrank.communities.name),
                 description = COALESCE(EXCLUDED.description, xrank.communities.description),
                 created_at = COALESCE(EXCLUDED.created_at, xrank.communities.created_at),
-                creator_username = COALESCE(EXCLUDED.creator_username, xrank.communities.creator_username),
+                creator_id = COALESCE(EXCLUDED.creator_id, xrank.communities.creator_id),
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -111,7 +113,7 @@ def process_members_file(conn, file_path: Path, dry_run: bool = False):
                 community_name,
                 community_description,
                 community_created_at,
-                creator_username,
+                creator_id,
             ),
         )
 

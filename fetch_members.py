@@ -10,6 +10,7 @@ This script fetches community members and moderators from Twitter/X communities:
 Rate limited to 10 requests per second to comply with API limits.
 """
 
+import base64
 import http.client
 import json
 import os
@@ -194,7 +195,18 @@ def get_community_details(community_id):
     creator_results = result.get("creator_results", {}).get("result", {})
     if creator_results:
         creator_legacy = creator_results.get("legacy", {})
+        # Extract user_id from base64 encoded id field (format: "User:<user_id>")
+        creator_user_id = None
+        encoded_id = creator_results.get("id")
+        if encoded_id:
+            try:
+                decoded = base64.b64decode(encoded_id).decode("utf-8")
+                if decoded.startswith("User:"):
+                    creator_user_id = decoded.split(":", 1)[1]
+            except Exception:
+                pass
         creator_info = {
+            "user_id": creator_user_id,
             "username": creator_legacy.get("screen_name"),
             "is_blue_verified": creator_results.get("is_blue_verified", False),
             "verified": creator_results.get("verification", {}).get("verified", False),

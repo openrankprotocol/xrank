@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS xrank.communities (
     name TEXT,                              -- Community name (e.g., "Story")
     description TEXT,                       -- Community description
     created_at TIMESTAMP,                   -- When the community was created on X
-    creator_username TEXT,                  -- Username of the community creator
+    creator_id BIGINT,                      -- User ID of the community creator
     imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- When we imported this community
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP    -- Last update timestamp
 );
