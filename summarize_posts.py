@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 import os
 import psycopg2
-import argparse
 import json
 import time
 import logging
 from typing import List, Optional, Dict, Any
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -55,48 +54,64 @@ Return only the JSON object, nothing else.
 """
 
 
+def fetch_all_community_ids(db_url: str) -> List[int]:
+    """
+    Fetch all distinct community_ids we have interactions for.
+    Mirrors fetch_all_channel_ids from the first script.
+    """
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT community_id FROM xrank.interactions;")
+            rows = cur.fetchall()
+            return [r[0] for r in rows]
+    finally:
+        conn.close()
+
 
 def get_top_posts(
     db_url: str,
     community_id: int,
-    run_id: Optional[int],
     limit: int,
 ) -> List[tuple]:
     """
     Fetch top posts for a single community.
 
-    We:
-      - Look at xrank.interactions inside the community
-      - Map each interaction to a "post_id" it contributes to
-        (post itself, reply target, quoted/retweeted post, etc.)
-      - Weight those interactions with the user's score from xrank.scores
-      - Rank root posts by this weighted interaction score.
-
-    If run_id is None, do not filter scores by run_id.
-
-    NOTE: We filter out posts whose text is NULL so we only summarize posts
-    that actually have content.
+    The logic mirrors the "latest_messages" pattern from the channel script:
+      1. First select the last 1000 actual posts (interaction_type='post')
+      2. Compute interactions and weighted scores only within that subset
+      3. Rank those posts and return the top {limit}
     """
+
     logger.debug(
-        "Fetching top posts for community_id=%s, run_id=%s, limit=%s",
+        "Fetching top posts for community_id=%s, limit=%s",
         community_id,
-        run_id,
         limit,
     )
 
     conn = psycopg2.connect(db_url)
     try:
         with conn.cursor() as cur:
-            run_id_filter = "AND s.run_id = %s" if run_id is not None else ""
 
-            # NOTE:
-            # - We treat every interaction row as contributing to some post_id:
-            #   COALESCE(reply_to_post_id, retweeted_post_id, quoted_post_id, post_id)
-            # - Then we join with xrank.scores based on (community_id, user_id).
-            # - Finally, we join the aggregated scores back to the "post" interactions
-            #   (interaction_type = 'post') that we actually want to summarize.
-            query = f"""
-                WITH interaction AS (
+            query = """
+                
+                WITH latest_posts AS (
+                    SELECT
+                        post_id,
+                        community_id,
+                        created_at,
+                        author_user_id,
+                        text
+                    FROM xrank.interactions
+                    WHERE community_id = %s
+                      AND interaction_type = 'post'
+                      AND text IS NOT NULL
+                    ORDER BY created_at DESC, post_id DESC
+                    LIMIT 1000
+                ),
+
+                
+                interaction AS (
                     SELECT
                         i.community_id,
                         COALESCE(
@@ -108,8 +123,17 @@ def get_top_posts(
                         i.author_user_id AS user_id,
                         i.interaction_type
                     FROM xrank.interactions i
-                    WHERE i.community_id = %s
+                    JOIN latest_posts lp
+                      ON lp.post_id = COALESCE(
+                            i.reply_to_post_id,
+                            i.retweeted_post_id,
+                            i.quoted_post_id,
+                            i.post_id
+                        )
+                     AND lp.community_id = i.community_id
                 ),
+
+                
                 interaction_scores AS (
                     SELECT
                         i.post_id,
@@ -120,53 +144,49 @@ def get_top_posts(
                     JOIN xrank.scores s
                       ON s.community_id = i.community_id
                      AND s.user_id = i.user_id
-                     {run_id_filter}
                 ),
+
+                
                 weighted AS (
                     SELECT
                         post_id,
                         SUM(
                             user_score *
                             CASE interaction_type
-                                WHEN 'post' THEN 5
-                                WHEN 'reply' THEN 10
+                                WHEN 'post'    THEN 5
+                                WHEN 'reply'   THEN 10
                                 WHEN 'comment' THEN 10
                                 WHEN 'retweet' THEN 15
-                                WHEN 'quote' THEN 20
+                                WHEN 'quote'   THEN 20
                                 ELSE 5
                             END
                         ) AS score
                     FROM interaction_scores
                     GROUP BY post_id
                 )
+
+                
                 SELECT
-                    p.post_id,
-                    p.community_id,
-                    p.created_at,
-                    p.author_user_id,
-                    p.text,
+                    lp.post_id,
+                    lp.community_id,
+                    lp.created_at,
+                    lp.author_user_id,
+                    lp.text,
                     COALESCE(w.score, 0) AS score
-                FROM xrank.interactions p
+                FROM latest_posts lp
                 LEFT JOIN weighted w
-                  ON w.post_id = p.post_id
-                WHERE p.community_id = %s
-                  AND p.interaction_type = 'post'
-                  AND p.text IS NOT NULL
-                ORDER BY score DESC, p.created_at DESC
+                  ON w.post_id = lp.post_id
+                ORDER BY score DESC, lp.created_at DESC
                 LIMIT %s
             """
 
-            if run_id is not None:
-                params = (community_id, run_id, community_id, limit)
-            else:
-                params = (community_id, community_id, limit)
-
-            cur.execute(query, params)
+            cur.execute(query, (community_id, limit))
             rows = cur.fetchall()
             logger.debug(
                 "Fetched %d posts for community_id=%s", len(rows), community_id
             )
             return rows
+
     finally:
         conn.close()
 
@@ -180,18 +200,15 @@ def summarize_with_openai(
     """
     Summarize messages (post texts) using a shared OpenAI client.
 
-    Improvements:
-      - Filters out empty or very short messages to save tokens / noise.
-      - If there is no sufficiently long content, returns a "No Content" summary
-        and skips the OpenAI call.
+    - Filters out empty or very short messages to save tokens / noise.
+    - If there is no sufficiently long content, returns None and
+      skips the OpenAI call.
 
     Retries if the response is not valid JSON or if OpenAI call fails.
     """
     logger.debug("Summarizing %d messages with OpenAI", len(messages))
 
-    # Filter out empty or very short messages to save tokens/noise
     valid_messages = [m for m in messages if m and len(m.strip()) > 5]
-
     if not valid_messages:
         logger.info("No valid messages to summarize; returning None")
         return None
@@ -212,7 +229,7 @@ def summarize_with_openai(
                 text={
                     "format": {
                         "type": "json_schema",
-                        "name": "channel_summary",
+                        "name": "community_summary",
                         "schema": {
                             "type": "object",
                             "properties": {
@@ -259,7 +276,6 @@ def summarize_with_openai(
 def process_community(
     db_url: str,
     community_id: int,
-    run_id: Optional[int],
     limit: int,
     client: OpenAI,
     max_retries: int = 2,
@@ -279,7 +295,7 @@ def process_community(
                 attempt + 1,
                 max_retries,
             )
-            rows = get_top_posts(db_url, community_id, run_id, limit)
+            rows = get_top_posts(db_url, community_id, limit)
             posts: List[Dict[str, Any]] = []
             for r in rows:
                 posts.append(
@@ -341,164 +357,74 @@ def process_community(
 def save_summaries(
     db_url: str,
     results: List[Dict[str, Any]],
-    run_id: Optional[int],
-    limit: int,
     model: str,
 ) -> None:
-    """
-    Persist summaries into xrank.community_summaries.
-
-    This assumes a table similar to trank.channel_summaries, e.g.:
-
-        CREATE TABLE xrank.community_summaries (
-            community_id BIGINT NOT NULL,
-            run_id INTEGER,
-            posts_limit INTEGER,
-            summary JSONB,
-            topic TEXT,
-            few_words TEXT,
-            one_sentence TEXT,
-            error TEXT,
-            model TEXT,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            PRIMARY KEY (community_id, run_id)
-        );
-
-    Adjust table/column names here if your schema differs.
-    """
     conn = psycopg2.connect(db_url)
     try:
         with conn:
             with conn.cursor() as cur:
                 for item in results:
-                    if "summary" not in item:
-                        continue
-
-                    s = item["summary"]
-                    if s is None:
+                    s = item.get("summary")
+                    if not s:
                         logger.info(
-                            "Skipping community_id=%s because summary is None",
+                            "Skipping community_id=%s because summary is missing/None",
                             item.get("community"),
                         )
                         continue
 
                     community_id = str(item["community"])
-                    topic = s.get("topic")
-                    few_words = s.get("few_words")
-                    one_sentence = s.get("one_sentence")
-                    error = s.get("error")
 
-                    if run_id is None:
-                        cur.execute(
-                            """
-                            INSERT INTO xrank.community_summaries (
-                                community_id,
-                                run_id,
-                                posts_limit,
-                                summary,
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model
-                            )
-                            VALUES (
-                                %s,
-                                NULL,
-                                %s,
-                                %s::jsonb,
-                                %s,
-                                %s,
-                                %s,
-                                %s,
-                                %s
-                            )
-                            ON CONFLICT (community_id)
-                            WHERE run_id IS NULL DO UPDATE SET
-                                posts_limit = EXCLUDED.posts_limit,
-                                summary = EXCLUDED.summary,
-                                topic = EXCLUDED.topic,
-                                few_words = EXCLUDED.few_words,
-                                one_sentence = EXCLUDED.one_sentence,
-                                error = EXCLUDED.error,
-                                model = EXCLUDED.model,
-                                created_at = NOW();
-                            """,
-                            (
-                                community_id,
-                                limit,
-                                json.dumps(s, ensure_ascii=False),
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model,
-                            ),
+                    cur.execute(
+                        """
+                        INSERT INTO xrank.community_summaries (
+                            community_id,
+                            summary,
+                            topic,
+                            few_words,
+                            one_sentence,
+                            error,
+                            model
                         )
-                    else:
-                        cur.execute(
-                            """
-                            INSERT INTO xrank.community_summaries (
-                                community_id,
-                                run_id,
-                                posts_limit,
-                                summary,
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model
-                            )
-                            VALUES (
-                                %s,
-                                %s,
-                                %s,
-                                %s::jsonb,
-                                %s,
-                                %s,
-                                %s,
-                                %s,
-                                %s
-                            )
-                            ON CONFLICT (community_id, run_id)
-                            WHERE run_id IS NOT NULL DO UPDATE SET
-                                posts_limit = EXCLUDED.posts_limit,
-                                summary = EXCLUDED.summary,
-                                topic = EXCLUDED.topic,
-                                few_words = EXCLUDED.few_words,
-                                one_sentence = EXCLUDED.one_sentence,
-                                error = EXCLUDED.error,
-                                model = EXCLUDED.model,
-                                created_at = NOW();
-                            """,
-                            (
-                                community_id,
-                                str(run_id),
-                                limit,
-                                json.dumps(s, ensure_ascii=False),
-                                topic,
-                                few_words,
-                                one_sentence,
-                                error,
-                                model,
-                            ),
+                        VALUES (
+                            %s,
+                            %s::jsonb,
+                            %s,
+                            %s,
+                            %s,
+                            %s,
+                            %s
                         )
+                        ON CONFLICT (community_id) DO UPDATE SET
+                            summary      = EXCLUDED.summary,
+                            topic        = EXCLUDED.topic,
+                            few_words    = EXCLUDED.few_words,
+                            one_sentence = EXCLUDED.one_sentence,
+                            error        = EXCLUDED.error,
+                            model        = EXCLUDED.model,
+                            created_at   = NOW();
+                        """,
+                        (
+                            community_id,
+                            json.dumps(s, ensure_ascii=False),
+                            s.get("topic"),
+                            s.get("few_words"),
+                            s.get("one_sentence"),
+                            s.get("error"),
+                            model,
+                        ),
+                    )
     finally:
         conn.close()
+
 
 
 def process_communities_concurrently(
     db_url: str,
     community_ids: List[int],
-    run_id: Optional[int],
     limit: int,
     client: OpenAI,
     max_workers: int = 10,
 ) -> List[Dict[str, Any]]:
-    """
-    Process multiple communities concurrently in a thread pool.
-    Uses a shared OpenAI client instance across all workers.
-    """
     logger.info(
         "Processing %d communities concurrently with max_workers=%d",
         len(community_ids),
@@ -512,7 +438,6 @@ def process_communities_concurrently(
                 process_community,
                 db_url,
                 community_id,
-                run_id,
                 limit,
                 client,
             ): community_id
@@ -529,18 +454,13 @@ def process_communities_concurrently(
                     community_id,
                     e,
                 )
-                res = {
-                    "community": community_id,
-                    "error": str(e),
-                }
+                res = {"community": community_id, "error": str(e)}
             results.append(res)
 
     logger.info("Finished processing all communities, uploading to db")
     save_summaries(
         db_url=db_url,
         results=results,
-        run_id=run_id,
-        limit=limit,
         model=model_name,
     )
     logger.info("Finished uploading to db")
@@ -553,38 +473,25 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--community-id",
-        type=int,
-        action="append",
-        dest="community_ids",
-        required=True,
-        help="Community ID (repeat this flag for multiple communities)",
-    )
-    parser.add_argument("--run-id", type=int, required=False)
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=50,
-        help="Number of top posts to summarize per community",
-    )
-    args = parser.parse_args()
-
     url = os.getenv("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL environment variable is required")
 
-    client = OpenAI()
+    limit = 50
+    max_workers = 5
 
-    _results = process_communities_concurrently(
-        db_url=url,
-        community_ids=args.community_ids,
-        run_id=args.run_id,
-        limit=args.limit,
-        client=client,
-        max_workers=5,
-    )
+    client = OpenAI()
+    community_ids = fetch_all_community_ids(url)
+    logger.info(f"Processing summaries for: {community_ids}")
+
+    if community_ids:
+        process_communities_concurrently(
+            db_url=url,
+            community_ids=community_ids,
+            limit=limit,
+            client=client,
+            max_workers=max_workers,
+        )
 
 
 if __name__ == "__main__":
