@@ -24,14 +24,14 @@ ids = [
     "1966141414703509919", # Sentient
 ]
 
-[seed_users]
-usernames = [
-    # "Saldasoro",
-    # "oyealmond",
-    # "gui_bettanin",
-    # "anabelen_eth",
-    "Lalocripto",
-    # "carlosjmelgar",
+[seed_graph]
+base_latam = [
+    "125514287", # Saldasoro
+    "33028027", # oyealmond
+    "1241730498298368000", # gui_bettanin
+    "1450256249619161091", # anabelen_eth
+    "1345809008121282561", # Lalocripto
+    "151378244", # carlosjmelgar
 ]
 
 [output]

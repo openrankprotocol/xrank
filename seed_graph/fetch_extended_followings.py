@@ -178,27 +178,29 @@ def make_request(endpoint, params="", max_retries=3):
 
 def load_seed_followings(raw_data_dir):
     """Load the seed followings master list for the active seed user from config"""
-    # Load config to get active seed username
+    # Load config to get active seed user ID
     config = load_config()
     if not config:
         return None, None, None
 
-    # Get active seed usernames (first non-commented one)
-    seed_usernames = config.get("seed_users", {}).get("usernames", [])
-    seed_usernames = [u for u in seed_usernames if u and not u.startswith("#")]
+    # Get active seed user IDs from [seed_graph] section
+    seed_graph_config = config.get("seed_graph", {})
+    seed_user_ids = []
+    for community_name, user_ids in seed_graph_config.items():
+        if isinstance(user_ids, list):
+            seed_user_ids.extend(str(uid) for uid in user_ids)
+    seed_user_ids = [uid for uid in seed_user_ids if uid and uid.isdigit()]
 
-    if not seed_usernames:
-        print(
-            "Error: No active seed username found in config.toml [seed_users] section"
-        )
-        print("Please uncomment a username in config.toml")
+    if not seed_user_ids:
+        print("Error: No active seed user ID found in config.toml [seed_graph] section")
+        print("Please add user IDs to a community in config.toml")
         return None, None, None
 
-    active_username = seed_usernames[0]
-    print(f"Using active seed user: @{active_username}")
+    active_user_id = seed_user_ids[0]
+    print(f"Using active seed user ID: {active_user_id}")
 
-    # Try to find the seed_followings file by searching for files with this username
-    # We need to check all *_seed_followings.json files to find the one with matching username
+    # Try to find the seed_followings file by searching for files with this user ID
+    # Files are named {user_id}_seed_followings.json
     import glob
 
     pattern = os.path.join(raw_data_dir, "*_seed_followings.json")
@@ -206,24 +208,17 @@ def load_seed_followings(raw_data_dir):
 
     filename = None
     for file_path in matching_files:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                seed_users = data.get("seed_users", [])
-                # Check if this file contains our active seed user
-                for seed_user in seed_users:
-                    if seed_user.get("username", "").lower() == active_username.lower():
-                        filename = file_path
-                        break
-                if filename:
-                    break
-        except:
-            continue
+        # Extract user_id from filename
+        basename = os.path.basename(file_path)
+        file_user_id = basename.split("_seed_followings.json")[0]
+        if file_user_id == active_user_id:
+            filename = file_path
+            break
 
     if not filename:
-        print(f"Error: Seed followings file not found for @{active_username}")
+        print(f"Error: Seed followings file not found for user ID {active_user_id}")
         print(
-            f"Please run fetch_followings.py first with @{active_username} in config.toml"
+            f"Please run fetch_followings.py first with user ID {active_user_id} in config.toml"
         )
         return None, None, None
 
@@ -402,7 +397,7 @@ def main():
     global rate_limiter, request_count, start_time
 
     # Initialize to avoid unbound variable in exception handler
-    raw_data_dir = "./raw"
+    raw_data_dir = "./raw/seed"
 
     try:
         # Load configuration
@@ -432,7 +427,9 @@ def main():
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.join(script_dir, "..")
         raw_data_dir_config = config.get("output", {}).get("raw_data_dir", "./raw")
-        raw_data_dir = os.path.join(project_root, raw_data_dir_config.lstrip("./"))
+        raw_data_dir = os.path.join(
+            project_root, raw_data_dir_config.lstrip("./"), "seed"
+        )
 
         max_following_per_user = config.get("data", {}).get(
             "max_following_per_user", 1000

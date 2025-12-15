@@ -511,26 +511,12 @@ def build_master_list(seed_usernames, max_parallel=4):
                     seed_user_info["following_count"] = len(following_users)
                     seed_user_id = seed_user_info["user_id"]
                     print(f"  ✓ Added seed user with real ID: {seed_user_id}")
+                    master_dict[seed_user_id] = seed_user_info
+                    seed_users_info.append(seed_user_info)
                 else:
-                    # Fallback to temporary ID if API call failed
-                    print(f"  ⚠️  Could not get real user ID, using temporary ID")
-                    seed_user_id = f"seed_{username}"
-                    seed_user_info = {
-                        "user_id": seed_user_id,
-                        "username": username,
-                        "display_name": username,
-                        "type": "seed",
-                        "followers_count": 0,
-                        "following_count": len(following_users),
-                        "verified": False,
-                        "verified_type": "",
-                        "description": "",
-                        "location": "",
-                        "created_at": "",
-                    }
-
-                master_dict[seed_user_id] = seed_user_info
-                seed_users_info.append(seed_user_info)
+                    # Skip this seed user if we can't get their real ID
+                    print(f"  ❌ Could not get real user ID for @{username}, skipping")
+                    continue
 
         except Exception as e:
             print(f"  Error processing seed user @{username}: {e}")
@@ -588,7 +574,7 @@ def main():
     global rate_limiter, request_count, start_time
 
     # Initialize to avoid unbound variable in exception handler
-    raw_data_dir = "./raw"
+    raw_data_dir = "./raw/seed"
 
     try:
         # Load configuration
@@ -596,18 +582,51 @@ def main():
         if not config:
             return
 
-        # Get seed usernames from config
-        seed_usernames = config.get("seed_users", {}).get("usernames", [])
-        if not seed_usernames:
-            print("Error: No seed usernames found in config.toml [seed_users] section")
+        # Get seed user IDs from config [seed_graph] section
+        seed_graph_config = config.get("seed_graph", {})
+        if not seed_graph_config:
+            print("Error: No [seed_graph] section found in config.toml")
             return
 
-        # Filter out commented usernames (shouldn't happen with TOML, but just in case)
-        seed_usernames = [u for u in seed_usernames if u and not u.startswith("#")]
+        # Collect all user IDs from all communities
+        seed_user_ids = []
+        for community_name, user_ids in seed_graph_config.items():
+            if isinstance(user_ids, list):
+                seed_user_ids.extend(str(uid) for uid in user_ids)
+
+        if not seed_user_ids:
+            print("Error: No seed user IDs found in config.toml [seed_graph] section")
+            return
+
+        # Filter out any invalid entries
+        seed_user_ids = [uid for uid in seed_user_ids if uid and uid.isdigit()]
+
+        if not seed_user_ids:
+            print("Error: No valid seed user IDs found")
+            return
+
+        print(f"Fetching user info for {len(seed_user_ids)} seed user IDs...")
+        # Fetch user info (including usernames) from user IDs
+        seed_users_info_list = get_users_info_batch(
+            seed_user_ids, batch_size=50, max_parallel=4
+        )
+
+        if not seed_users_info_list:
+            print("Error: Could not fetch user info for seed user IDs")
+            return
+
+        # Extract usernames from fetched user info
+        seed_usernames = [
+            user.get("username")
+            for user in seed_users_info_list
+            if user.get("username")
+        ]
 
         if not seed_usernames:
-            print("Error: No valid seed usernames found")
+            print("Error: No valid usernames found for seed user IDs")
             return
+
+        print(f"Resolved {len(seed_usernames)} usernames from user IDs")
 
         # Initialize rate limiter with config values (default to 10 for RapidAPI)
         requests_per_second = config.get("rate_limiting", {}).get(
@@ -625,14 +644,18 @@ def main():
         print(f"Seed Users Following Fetcher")
         print(f"Rate limiting: {requests_per_second} requests/second")
         print(f"Max parallel requests: {max_parallel}")
-        print(f"Seed users to process: {len(seed_usernames)}")
+        print(
+            f"Seed users to process: {len(seed_usernames)} (from {len(seed_user_ids)} user IDs)"
+        )
         print(f"=" * 60)
 
         # Get raw_data_dir and make it relative to project root
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.join(script_dir, "..")
         raw_data_dir_config = config.get("output", {}).get("raw_data_dir", "./raw")
-        raw_data_dir = os.path.join(project_root, raw_data_dir_config.lstrip("./"))
+        raw_data_dir = os.path.join(
+            project_root, raw_data_dir_config.lstrip("./"), "seed"
+        )
 
         # Build master list from seed users' followings
         master_list, seed_users_info = build_master_list(
