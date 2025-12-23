@@ -6,12 +6,12 @@ This script imports seed graph scores from scores/ and seed/ directories
 into the xrank_seed PostgreSQL tables.
 
 Imports data from CSV files:
-- scores/{seed_graph_id}.csv -> xrank_seed.runs, xrank_seed.scores tables
-- seed/{seed_graph_id}.csv -> xrank_seed.seeds table
+- scores/{community_id}.csv -> xrank_seed.runs, xrank_seed.scores tables
+- seed/{community_id}.csv -> xrank_seed.seeds table
 
 Usage:
     python3 seed_graph/import_scores_to_db.py                    # Import all seed graphs from config
-    python3 seed_graph/import_scores_to_db.py --seed-graph base_latam  # Import specific seed graph
+    python3 seed_graph/import_scores_to_db.py --community base_latam  # Import specific community
     python3 seed_graph/import_scores_to_db.py --dry-run          # Show what would be imported
 
 Requirements:
@@ -49,8 +49,8 @@ def load_config():
         return None
 
 
-def get_seed_graph_ids_from_config():
-    """Get all seed graph IDs (community names) from config.toml [seed_graph] section."""
+def get_community_ids_from_config():
+    """Get all community IDs (community names) from config.toml [seed_graph] section."""
     config = load_config()
     if not config:
         return []
@@ -91,50 +91,50 @@ def create_tables_if_not_exist(conn, dry_run: bool = False):
         # Create runs table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS xrank_seed.runs (
-                seed_graph_id TEXT NOT NULL,
+                community_id TEXT NOT NULL,
                 run_id INTEGER NOT NULL,
                 days_back INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (seed_graph_id, run_id)
+                PRIMARY KEY (community_id, run_id)
             )
         """)
 
         # Create scores table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS xrank_seed.scores (
-                seed_graph_id TEXT NOT NULL,
+                community_id TEXT NOT NULL,
                 run_id INTEGER NOT NULL,
                 user_id BIGINT NOT NULL,
                 score DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (seed_graph_id, run_id, user_id),
-                FOREIGN KEY (seed_graph_id, run_id) REFERENCES xrank_seed.runs(seed_graph_id, run_id) ON DELETE CASCADE
+                PRIMARY KEY (community_id, run_id, user_id),
+                FOREIGN KEY (community_id, run_id) REFERENCES xrank_seed.runs(community_id, run_id) ON DELETE CASCADE
             )
         """)
 
         # Create seeds table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS xrank_seed.seeds (
-                seed_graph_id TEXT NOT NULL,
+                community_id TEXT NOT NULL,
                 run_id INTEGER NOT NULL,
                 user_id BIGINT NOT NULL,
                 score DOUBLE PRECISION NOT NULL,
-                PRIMARY KEY (seed_graph_id, run_id, user_id),
-                FOREIGN KEY (seed_graph_id, run_id) REFERENCES xrank_seed.runs(seed_graph_id, run_id) ON DELETE CASCADE
+                PRIMARY KEY (community_id, run_id, user_id),
+                FOREIGN KEY (community_id, run_id) REFERENCES xrank_seed.runs(community_id, run_id) ON DELETE CASCADE
             )
         """)
 
         # Create indexes
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_seed_runs_seed_graph ON xrank_seed.runs(seed_graph_id)
+            CREATE INDEX IF NOT EXISTS idx_seed_runs_community ON xrank_seed.runs(community_id)
         """)
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_seed_scores_seed_graph_run ON xrank_seed.scores(seed_graph_id, run_id)
+            CREATE INDEX IF NOT EXISTS idx_seed_scores_community_run ON xrank_seed.scores(community_id, run_id)
         """)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_seed_scores_score ON xrank_seed.scores(score DESC)
         """)
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_seed_seeds_seed_graph_run ON xrank_seed.seeds(seed_graph_id, run_id)
+            CREATE INDEX IF NOT EXISTS idx_seed_seeds_community_run ON xrank_seed.seeds(community_id, run_id)
         """)
 
         conn.commit()
@@ -143,42 +143,42 @@ def create_tables_if_not_exist(conn, dry_run: bool = False):
         cursor.close()
 
 
-def create_run(conn, seed_graph_id: str, days_back: int, dry_run: bool = False):
-    """Create a new run entry and return the run_id (per-seed_graph incrementing)."""
+def create_run(conn, community_id: str, days_back: int, dry_run: bool = False):
+    """Create a new run entry and return the run_id (per-community incrementing)."""
     if dry_run:
-        print(f"  🔍 Dry run - would create run for seed graph {seed_graph_id}")
+        print(f"  🔍 Dry run - would create run for community {community_id}")
         return 1  # Return dummy run_id for dry run
 
     cursor = conn.cursor()
     try:
-        # Get next run_id for this seed_graph
+        # Get next run_id for this community
         cursor.execute(
             """
             SELECT COALESCE(MAX(run_id), 0) + 1
             FROM xrank_seed.runs
-            WHERE seed_graph_id = %s
+            WHERE community_id = %s
             """,
-            (seed_graph_id,),
+            (community_id,),
         )
         run_id = cursor.fetchone()[0]
 
         # Insert new run
         cursor.execute(
             """
-            INSERT INTO xrank_seed.runs (seed_graph_id, run_id, days_back)
+            INSERT INTO xrank_seed.runs (community_id, run_id, days_back)
             VALUES (%s, %s, %s)
             """,
-            (seed_graph_id, run_id, days_back),
+            (community_id, run_id, days_back),
         )
         conn.commit()
-        print(f"  ✅ Created run {run_id} for seed graph {seed_graph_id}")
+        print(f"  ✅ Created run {run_id} for community {community_id}")
         return run_id
     finally:
         cursor.close()
 
 
 def process_scores_file(
-    conn, file_path: Path, seed_graph_id: str, run_id: int, dry_run: bool = False
+    conn, file_path: Path, community_id: str, run_id: int, dry_run: bool = False
 ):
     """Process a scores CSV file and import into xrank_seed.scores table."""
     print(f"  📂 Loading scores from: {file_path.name}")
@@ -192,7 +192,7 @@ def process_scores_file(
             if user_id and score:
                 try:
                     scores_data.append(
-                        (seed_graph_id, run_id, int(user_id), float(score))
+                        (community_id, run_id, int(user_id), float(score))
                     )
                 except ValueError:
                     # Skip rows with invalid user_id or score
@@ -212,9 +212,9 @@ def process_scores_file(
             execute_values(
                 cursor,
                 """
-                INSERT INTO xrank_seed.scores (seed_graph_id, run_id, user_id, score)
+                INSERT INTO xrank_seed.scores (community_id, run_id, user_id, score)
                 VALUES %s
-                ON CONFLICT (seed_graph_id, run_id, user_id) DO UPDATE SET
+                ON CONFLICT (community_id, run_id, user_id) DO UPDATE SET
                     score = EXCLUDED.score
                 """,
                 scores_data,
@@ -235,7 +235,7 @@ def process_scores_file(
 
 
 def process_seed_file(
-    conn, file_path: Path, seed_graph_id: str, run_id: int, dry_run: bool = False
+    conn, file_path: Path, community_id: str, run_id: int, dry_run: bool = False
 ):
     """Process a seed CSV file and import into xrank_seed.seeds table."""
     print(f"  📂 Loading seeds from: {file_path.name}")
@@ -248,9 +248,7 @@ def process_seed_file(
             score = row.get("v")
             if user_id and score:
                 try:
-                    seed_data.append(
-                        (seed_graph_id, run_id, int(user_id), float(score))
-                    )
+                    seed_data.append((community_id, run_id, int(user_id), float(score)))
                 except ValueError:
                     # Skip rows with invalid user_id or score
                     continue
@@ -269,9 +267,9 @@ def process_seed_file(
             execute_values(
                 cursor,
                 """
-                INSERT INTO xrank_seed.seeds (seed_graph_id, run_id, user_id, score)
+                INSERT INTO xrank_seed.seeds (community_id, run_id, user_id, score)
                 VALUES %s
-                ON CONFLICT (seed_graph_id, run_id, user_id) DO UPDATE SET
+                ON CONFLICT (community_id, run_id, user_id) DO UPDATE SET
                     score = EXCLUDED.score
                 """,
                 seed_data,
@@ -292,19 +290,19 @@ def process_seed_file(
 
 
 def import_seed_graph(
-    conn, seed_graph_id: str, project_root: str, days_back: int, dry_run: bool = False
+    conn, community_id: str, project_root: str, days_back: int, dry_run: bool = False
 ):
-    """Import scores and seeds for a specific seed graph."""
+    """Import scores and seeds for a specific community."""
     print(f"\n{'=' * 50}")
-    print(f"📊 Importing seed graph: {seed_graph_id}")
+    print(f"📊 Importing community: {community_id}")
     print(f"{'=' * 50}")
 
     scores_dir = os.path.join(project_root, "scores")
     seed_dir = os.path.join(project_root, "seed")
 
-    # Check for scores file (could be seed_graph.csv or {seed_graph_id}.csv)
+    # Check for scores file (could be seed_graph.csv or {community_id}.csv)
     scores_file = None
-    for filename in [f"{seed_graph_id}.csv", "seed_graph.csv"]:
+    for filename in [f"{community_id}.csv", "seed_graph.csv"]:
         potential_path = Path(scores_dir) / filename
         if potential_path.exists():
             scores_file = potential_path
@@ -312,19 +310,19 @@ def import_seed_graph(
 
     # Check for seed file
     seed_file = None
-    for filename in [f"{seed_graph_id}.csv", "seed_graph.csv"]:
+    for filename in [f"{community_id}.csv", "seed_graph.csv"]:
         potential_path = Path(seed_dir) / filename
         if potential_path.exists():
             seed_file = potential_path
             break
 
     if not scores_file and not seed_file:
-        print(f"  ⚠️  No scores or seed files found for {seed_graph_id}")
+        print(f"  ⚠️  No scores or seed files found for {community_id}")
         print(f"      Looked in: {scores_dir} and {seed_dir}")
         return
 
     # Create a new run
-    run_id = create_run(conn, seed_graph_id, days_back, dry_run)
+    run_id = create_run(conn, community_id, days_back, dry_run)
 
     total_scores = 0
     total_seeds = 0
@@ -332,18 +330,18 @@ def import_seed_graph(
     # Import scores
     if scores_file:
         total_scores = process_scores_file(
-            conn, scores_file, seed_graph_id, run_id, dry_run
+            conn, scores_file, community_id, run_id, dry_run
         )
     else:
         print(f"  ⚠️  No scores file found")
 
     # Import seeds
     if seed_file:
-        total_seeds = process_seed_file(conn, seed_file, seed_graph_id, run_id, dry_run)
+        total_seeds = process_seed_file(conn, seed_file, community_id, run_id, dry_run)
     else:
         print(f"  ⚠️  No seed file found")
 
-    print(f"\n  📈 Summary for {seed_graph_id}:")
+    print(f"\n  📈 Summary for {community_id}:")
     print(f"      Run ID: {run_id}")
     print(f"      Scores imported: {total_scores}")
     print(f"      Seeds imported: {total_seeds}")
@@ -355,9 +353,9 @@ def main():
         description="Import seed graph scores from scores/ and seed/ to xrank_seed database tables"
     )
     parser.add_argument(
-        "--seed-graph",
+        "--community",
         type=str,
-        help="Specific seed graph ID to import (e.g., base_latam)",
+        help="Specific community ID to import (e.g., base_latam)",
     )
     parser.add_argument(
         "--dry-run",
@@ -374,19 +372,19 @@ def main():
     # Get days_back from config
     days_back = config.get("data", {}).get("days_back", 365)
 
-    # Determine which seed graphs to import
-    if args.seed_graph:
-        seed_graph_ids = [args.seed_graph]
+    # Determine which communities to import
+    if args.community:
+        community_ids = [args.community]
     else:
-        seed_graph_ids = get_seed_graph_ids_from_config()
+        community_ids = get_community_ids_from_config()
 
-    if not seed_graph_ids:
-        print("❌ No seed graph IDs found in config.toml [seed_graph] section")
+    if not community_ids:
+        print("❌ No community IDs found in config.toml [seed_graph] section")
         sys.exit(1)
 
     print(f"🔗 SEED GRAPH SCORES IMPORTER")
     print(f"{'=' * 50}")
-    print(f"📋 Seed graphs to import: {', '.join(seed_graph_ids)}")
+    print(f"📋 Communities to import: {', '.join(community_ids)}")
     print(f"📅 Days back: {days_back}")
 
     if args.dry_run:
@@ -408,14 +406,14 @@ def main():
         ensure_schema_exists(conn, args.dry_run)
         create_tables_if_not_exist(conn, args.dry_run)
 
-        # Import each seed graph
-        for seed_graph_id in seed_graph_ids:
+        # Import each community
+        for community_id in community_ids:
             try:
                 import_seed_graph(
-                    conn, seed_graph_id, project_root, days_back, args.dry_run
+                    conn, community_id, project_root, days_back, args.dry_run
                 )
             except Exception as e:
-                print(f"❌ Error importing {seed_graph_id}: {e}")
+                print(f"❌ Error importing {community_id}: {e}")
                 import traceback
 
                 traceback.print_exc()

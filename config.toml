@@ -25,13 +25,62 @@ ids = [
 ]
 
 [seed_graph]
-base_latam = [
-    "125514287", # Saldasoro
-    "33028027", # oyealmond
-    "1241730498298368000", # gui_bettanin
-    "1450256249619161091", # anabelen_eth
-    "1345809008121282561", # Lalocripto
-    "151378244", # carlosjmelgar
+# base_latam = [
+#     "125514287", # Saldasoro
+#     "33028027", # oyealmond
+#     "1241730498298368000", # gui_bettanin
+#     "1450256249619161091", # anabelen_eth
+#     "1345809008121282561", # Lalocripto
+#     "151378244", # carlosjmelgar
+# ]
+
+optimism = [
+    "1339694846", # opmichael_eth
+    "1379415847", # HelloShreyas
+    "117817623", # singularityhack
+    "265331258", # aaronsoskin
+    "1438575484368007173", # shanvasion
+    "2846592125", # bernasheq
+    "2661084708", # akhilasraju
+    "1243106354656616450", # theshelb_
+    "50858307", # garysheng
+    "713094195955830785", # m1guelpf
+    # trent.eth - NOT FOUND
+    "799379530993385472", # allisondman
+    "15156181", # matdryhurst
+    "77152055", # futurealisha
+    "1052561847356977152", # morrishuang03
+    "14356633", # kentf
+    "322684937", # yitong
+    "802074", # charlief
+    "193749466", # charliecfeng
+    "12293152", # jmclarty
+    "676573", # tobi
+    "109628138", # andreitr
+    "1907745589477126145", # Jamilya_eth
+    "3040070879", # stepanarsent
+    "69619073", # andrewdsouza
+    "2868453062", # zvsdev
+    "358278852", # mmazco
+    "2789328987", # CryptoEcon_Li
+    "152420744", # bbeats1
+    "1715357387022868480", # emjicy
+    "54111479", # brennanfoo
+    "1338638378154258437", # phasfernandes
+    "67435852", # canaldofrossard
+    "216939636", # AndrewYNg
+    "505835394", # ericzakariasson
+    "1458487179273977863", # Skarlus_
+    "1433749066672902144", # br1dge_eth
+    "295218901", # VitalikButerin
+    "902926941413453824", # cz_binance
+    "244647486", # saylor
+    "339061487", # APompliano
+    "2178012643", # balajis
+    "26377478", # laurashin
+    "1854401", # VinnyLingham
+    # aeyakovenko - NOT FOUND
+    "80722677", # TimBeiko
 ]
 
 [output]
