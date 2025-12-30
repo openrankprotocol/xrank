@@ -66,8 +66,8 @@ def load_config():
     try:
         # Get the directory where this script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Config is in the parent directory
-        config_path = os.path.join(script_dir, "..", "config.toml")
+        # Config is in the same directory as the script
+        config_path = os.path.join(script_dir, "config.toml")
         with open(config_path, "r") as f:
             return toml.load(f)
     except FileNotFoundError:
@@ -246,22 +246,10 @@ def get_user_info(username):
         "user_id": rest_id,
         "username": legacy.get("screen_name", username),
         "display_name": legacy.get("name", username),
-        "followers_count": legacy.get("followers_count", 0),
-        "following_count": legacy.get("friends_count", 0),
-        "verified": legacy.get("verified", False),
-        "verified_type": user_result.get("verification_info", {})
-        .get("reason", {})
-        .get("description", {})
-        .get("text", ""),
-        "description": legacy.get("description", ""),
-        "location": legacy.get("location", ""),
-        "created_at": legacy.get("created_at", ""),
     }
 
     if user_info["user_id"]:
-        print(
-            f"  ✓ Got user info: ID={user_info['user_id']}, followers={user_info['followers_count']}"
-        )
+        print(f"  ✓ Got user info: ID={user_info['user_id']}, @{user_info['username']}")
         return user_info
     else:
         print(f"  Could not extract user_id from response for @{username}")
@@ -308,13 +296,6 @@ def fetch_single_batch(batch, batch_num, total_batches):
                 "user_id": str(user_data.get("id_str") or user_data.get("id", "")),
                 "username": user_data.get("screen_name", ""),
                 "display_name": user_data.get("name", ""),
-                "followers_count": user_data.get("followers_count", 0),
-                "following_count": user_data.get("friends_count", 0),
-                "verified": user_data.get("verified", False),
-                "verified_type": "",  # Not directly in v2 response
-                "description": user_data.get("description", ""),
-                "location": user_data.get("location", ""),
-                "created_at": user_data.get("created_at", ""),
             }
 
             # Only add users with valid usernames
@@ -484,16 +465,13 @@ def build_master_list(seed_usernames, max_parallel=4):
             for user in following_users:
                 user_id = user.get("user_id")
                 if user_id and user_id not in master_dict:
-                    # Mark if this is a seed user
-                    user["type"] = "following"
                     master_dict[user_id] = user
 
-            # Mark this username as a seed user (in case they appear in followings)
+            # Check if seed user appears in followings
             # If not, we'll need to get their info separately
             found_seed_user = False
             for user_id, user in master_dict.items():
                 if user.get("username", "").lower() == username.lower():
-                    user["type"] = "seed"
                     seed_users_info.append(user)
                     found_seed_user = True
                     break
@@ -507,8 +485,6 @@ def build_master_list(seed_usernames, max_parallel=4):
 
                 if seed_user_info and seed_user_info.get("user_id"):
                     # Got real user info
-                    seed_user_info["type"] = "seed"
-                    seed_user_info["following_count"] = len(following_users)
                     seed_user_id = seed_user_info["user_id"]
                     print(f"  ✓ Added seed user with real ID: {seed_user_id}")
                     master_dict[seed_user_id] = seed_user_info
@@ -537,11 +513,10 @@ def build_master_list(seed_usernames, max_parallel=4):
     return master_list, seed_users_info
 
 
-def save_seed_followings(master_list, seed_users_info, raw_data_dir):
+def save_seed_followings(master_list, seed_users_info, raw_data_dir, seed_graph_name):
     """Save master list to JSON file"""
-    # Get the first seed user's ID for filename prefix
-    seed_user_id = seed_users_info[0].get("user_id") if seed_users_info else "unknown"
-    filename = os.path.join(raw_data_dir, f"{seed_user_id}_seed_followings.json")
+    # Use seed_graph_name for filename
+    filename = os.path.join(raw_data_dir, f"{seed_graph_name}_followings.json")
     os.makedirs(raw_data_dir, exist_ok=True)
 
     output_data = {
@@ -587,6 +562,11 @@ def main():
         if not seed_graph_config:
             print("Error: No [seed_graph] section found in config.toml")
             return
+
+        # Get the first (and typically only) community name from seed_graph
+        seed_graph_name = (
+            list(seed_graph_config.keys())[0] if seed_graph_config else "unknown"
+        )
 
         # Collect all user IDs from all communities
         seed_user_ids = []
@@ -649,13 +629,10 @@ def main():
         )
         print(f"=" * 60)
 
-        # Get raw_data_dir and make it relative to project root
+        # Get raw_data_dir and make it relative to script directory
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.join(script_dir, "..")
         raw_data_dir_config = config.get("output", {}).get("raw_data_dir", "./raw")
-        raw_data_dir = os.path.join(
-            project_root, raw_data_dir_config.lstrip("./"), "seed"
-        )
+        raw_data_dir = os.path.join(script_dir, raw_data_dir_config.lstrip("./"))
 
         # Build master list from seed users' followings
         master_list, seed_users_info = build_master_list(
@@ -664,7 +641,9 @@ def main():
 
         # Save to file
         if master_list:
-            save_seed_followings(master_list, seed_users_info, raw_data_dir)
+            save_seed_followings(
+                master_list, seed_users_info, raw_data_dir, seed_graph_name
+            )
         else:
             print("No data collected")
 

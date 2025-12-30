@@ -4,36 +4,7 @@
 # Number of days to go back for fetching posts
 days_back = 365
 
-# Maximum posts per community (0 = unlimited)
-post_limit = 10000
-
-# Maximum following IDs to fetch per user
-max_following_per_user = 1000
-
-# Maximum posts to fetch per user (for seed interactions)
-post_limit_per_user = 500
-
-[communities]
-# List of community IDs to fetch from
-ids = [
-    "1917017448341246418", # EigenTribe
-    "1896991026272723220", # Ritual
-    "1884047066877550776", # MegaETH
-    "1872222575180546208", # Story
-    "1920364230756479110", # Aztec
-    "1966141414703509919", # Sentient
-]
-
 [seed_graph]
-# base_latam = [
-#     "125514287", # Saldasoro
-#     "33028027", # oyealmond
-#     "1241730498298368000", # gui_bettanin
-#     "1450256249619161091", # anabelen_eth
-#     "1345809008121282561", # Lalocripto
-#     "151378244", # carlosjmelgar
-# ]
-
 optimism = [
     "1339694846", # opmichael_eth
     "1379415847", # HelloShreyas
@@ -94,7 +65,7 @@ raw_data_dir = "./raw"
 requests_per_second = 1000
 
 # Maximum parallel requests when fetching posts for a user (default: 4)
-max_parallel_requests = 100
+max_parallel_requests = 20
 
 # Delay between requests (seconds) - calculated as 1/requests_per_second
 request_delay = 0.0

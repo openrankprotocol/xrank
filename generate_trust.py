@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
 """
-Trust Score Generator
+Seed Graph Trust Score Generator
 
-This script generates local trust scores between users based on their interactions:
-1. Loads members interactions, following network, and comment graph from raw/
+This script generates local trust scores between users based on seed interactions:
+1. Loads ALL *_seed_extended_followings.json, *_seed_followings.json, and *_seed_interactions.json from raw/seed/
+   OR loads {seed_graph}_{range}.json and {seed_graph}_followings.json from raw/
 2. Creates local trust scores from one user to another based on interactions
 3. Assigns weights to each interaction type based on config.toml trust_weights
-4. Aggregates scores for each unique i,j pair
-5. Saves local trust to trust/[community_id].csv with header i,j,v
+4. Deduplicates data across seed files (same posts, followings, etc. only counted once)
+5. Aggregates scores for each unique i,j pair
+6. Saves merged local trust to trust/seed_graph.csv with header i,j,v
 
 Interaction types and their sources:
-- follow: from following_network.json
-- mention: from members interactions (posts mentioning other users)
-- reply: from members interactions (reply posts) and comment_graph.json (comments are treated as replies)
-- retweet: from members interactions (retweet posts)
-- quote: from members interactions (quote posts)
+- follow: from seed_followings.json (only seed users -> master_list) and seed_extended_followings.json (only towards master_list)
+- mention: from seed_interactions.json (posts mentioning other users)
+- reply: from seed_interactions.json (reply posts and replies list)
+- retweet: from seed_interactions.json (retweet posts)
+- quote: from seed_interactions.json (quote posts)
 
-Note: All user references are by user_id (not username).
-Note: Comments from comment_graph.json are treated as reply interactions since they represent the same behavior.
+Seed Graph Follow Relationships:
+- seed_followings.json: Only creates follow relationships from seed users TO master_list users
+- seed_extended_followings.json: Only creates follow relationships towards master_list users
+
+Deduplication Strategy:
+- Follow relationships: tracked by (source, target) pair
+- Posts/Replies: tracked by post_id to avoid counting same post multiple times
+- Same interaction from duplicate data is only counted once
+
+Note: Unlike the community version, this does NOT apply 2x weight multiplier for any posts,
+as there is no concept of "community posts" in the seed graph context.
 """
 
 import csv
+import glob
 import json
 import os
 import re
@@ -33,7 +45,11 @@ import toml
 def load_config():
     """Load configuration from config.toml"""
     try:
-        with open("config.toml", "r") as f:
+        # Get the directory where this script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Config is in the same directory as the script
+        config_path = os.path.join(script_dir, "config.toml")
+        with open(config_path, "r") as f:
             config = toml.load(f)
             print("✓ Configuration loaded successfully")
             return config
@@ -43,6 +59,31 @@ def load_config():
     except Exception as e:
         print(f"❌ Error loading config: {e}")
         return None
+
+
+def get_seed_user_ids_from_config():
+    """Get all seed user IDs from config.toml [seed_graph] section."""
+    config = load_config()
+    if not config:
+        return set()
+
+    seed_graph_config = config.get("seed_graph", {})
+    seed_user_ids = set()
+    for community_name, user_ids in seed_graph_config.items():
+        if isinstance(user_ids, list):
+            seed_user_ids.update(str(uid) for uid in user_ids)
+
+    return seed_user_ids
+
+
+def get_seed_graph_names_from_config():
+    """Get all seed graph names from config.toml [seed_graph] section."""
+    config = load_config()
+    if not config:
+        return []
+
+    seed_graph_config = config.get("seed_graph", {})
+    return list(seed_graph_config.keys())
 
 
 def load_json_file(file_path):
@@ -68,6 +109,93 @@ def normalize_username(username):
     return username.lower().strip().lstrip("@")
 
 
+def normalize_user_id(user_id):
+    """Normalize user_id to string format"""
+    if not user_id:
+        return ""
+    return str(user_id).strip()
+
+
+def build_username_to_id_map(
+    followings_data, extended_followings_data, interactions_data
+):
+    """Build a mapping from normalized username to user_id from all data sources"""
+    username_to_id = {}
+
+    # From followings data - master_list and seed_users
+    if followings_data:
+        for user in followings_data.get("master_list", []):
+            username = normalize_username(user.get("username", ""))
+            user_id = normalize_user_id(user.get("user_id", ""))
+            if username and user_id:
+                username_to_id[username] = user_id
+
+        for user in followings_data.get("seed_users", []):
+            username = normalize_username(user.get("username", ""))
+            user_id = normalize_user_id(user.get("user_id", ""))
+            if username and user_id:
+                username_to_id[username] = user_id
+
+    # From extended followings data
+    if extended_followings_data:
+        for user in extended_followings_data.get("users", []):
+            username = normalize_username(user.get("username", ""))
+            user_id = normalize_user_id(user.get("user_id", ""))
+            if username and user_id:
+                username_to_id[username] = user_id
+
+    # From interactions data
+    if interactions_data:
+        for user in interactions_data.get("users", []):
+            username = normalize_username(user.get("username", ""))
+            user_id = normalize_user_id(user.get("user_id", ""))
+            if username and user_id:
+                username_to_id[username] = user_id
+
+    return username_to_id
+
+
+def build_username_to_id_map_from_raw(
+    followings_data, interactions_data_list, extended_followings_data=None
+):
+    """Build a mapping from normalized username to user_id from raw data sources"""
+    username_to_id = {}
+
+    # From followings data - master_list and seed_users
+    if followings_data:
+        for user in followings_data.get("master_list", []):
+            username = normalize_username(user.get("username", ""))
+            user_id = normalize_user_id(user.get("user_id", ""))
+            if username and user_id:
+                username_to_id[username] = user_id
+
+        for user in followings_data.get("seed_users", []):
+            username = normalize_username(user.get("username", ""))
+            user_id = normalize_user_id(user.get("user_id", ""))
+            if username and user_id:
+                username_to_id[username] = user_id
+
+    # From interactions data files
+    for interactions_data in interactions_data_list:
+        if interactions_data:
+            for user in interactions_data.get("users", []):
+                username = normalize_username(user.get("username", ""))
+                user_id = normalize_user_id(user.get("user_id", ""))
+                if username and user_id:
+                    username_to_id[username] = user_id
+
+    # From extended_followings.json users list
+    if extended_followings_data:
+        users = extended_followings_data.get("users", [])
+        for user in users:
+            username = normalize_username(user.get("username", ""))
+            user_id = normalize_user_id(user.get("user_id", ""))
+            if username and user_id:
+                username_to_id[username] = user_id
+
+    return username_to_id
+
+
 def extract_mentions(text):
     """Extract mentioned usernames from text"""
     if not text:
@@ -78,68 +206,136 @@ def extract_mentions(text):
     return [normalize_username(mention) for mention in mentions]
 
 
-def build_username_to_id_lookup(members_data, following_data=None):
-    """Build a lookup dictionary from username to user_id"""
-    username_to_id = {}
+def process_seed_followings(
+    followings_data, trust_weights, seen_follows, username_to_id
+):
+    """Process seed_followings.json to extract follow relationships towards master_list only
 
-    # Add from members_interactions
-    if members_data and "members_interactions" in members_data:
-        for member in members_data["members_interactions"]:
-            user_id = str(member.get("user_id", ""))
-            username = normalize_username(member.get("username", ""))
-            if user_id and username:
-                username_to_id[username] = user_id
-
-    # Add from following_network
-    if following_data and "following_network" in following_data:
-        for user in following_data["following_network"]:
-            user_id = str(user.get("user_id", ""))
-            username = normalize_username(user.get("username", ""))
-            if user_id and username:
-                username_to_id[username] = user_id
-
-    return username_to_id
-
-
-def process_following_network(following_data, trust_weights):
-    """Process following network to extract follow relationships using user_ids"""
+    Args:
+        followings_data: The followings data structure
+        trust_weights: Weight configuration
+        seen_follows: Set of (source, target) tuples to track duplicate follows
+        username_to_id: Mapping from username to user_id
+    """
     interactions = []
-    if not following_data or "following_network" not in following_data:
+    if not followings_data:
         return interactions
 
     follow_weight = trust_weights.get("follow", 30)
-    print(f"  Processing following network with weight {follow_weight}")
+    print(f"  Processing seed_followings.json with weight {follow_weight}")
 
+    # Get seed users and master list
+    seed_users = followings_data.get("seed_users", [])
+    master_list = followings_data.get("master_list", [])
+
+    if not seed_users or not master_list:
+        print(f"    No seed users or master list found")
+        return interactions
+
+    # Create follow relationships from seed users to master list users
     follow_count = 0
-    for user in following_data["following_network"]:
-        follower_id = str(user.get("user_id", ""))
-        if not follower_id:
+    for seed_user in seed_users:
+        seed_user_id = normalize_user_id(seed_user.get("user_id", ""))
+        if not seed_user_id:
             continue
 
-        following_list = user.get("following", [])
-        for followed_user_id in following_list:
-            followed_id = str(followed_user_id)
-            if followed_id and follower_id != followed_id:
-                interactions.append(
-                    {
-                        "type": "follow",
-                        "source": follower_id,
-                        "target": followed_id,
-                        "weight": follow_weight,
-                    }
-                )
-                follow_count += 1
+        # Each seed user follows all users in master_list
+        for master_user in master_list:
+            master_user_id = normalize_user_id(master_user.get("user_id", ""))
+            if master_user_id and seed_user_id != master_user_id:
+                # Check for duplicates
+                follow_pair = (seed_user_id, master_user_id)
+                if follow_pair not in seen_follows:
+                    seen_follows.add(follow_pair)
+                    interactions.append(
+                        {
+                            "type": "follow",
+                            "source": seed_user_id,
+                            "target": master_user_id,
+                            "weight": follow_weight,
+                        }
+                    )
+                    follow_count += 1
 
-    print(f"    Found {follow_count} follow relationships")
+    print(
+        f"    Found {follow_count} unique follow relationships (seed users -> master_list)"
+    )
     return interactions
 
 
-def process_members_interactions(
-    members_data, trust_weights, username_to_id, community_id
+def process_seed_extended_followings(
+    seed_extended_data, trust_weights, seen_follows=None
 ):
-    """Process member interactions to extract various interaction types using user_ids"""
+    """Process seed_extended_followings.json to extract follow relationships
+
+    Args:
+        seed_extended_data: The extended followings data structure
+        trust_weights: Weight configuration
+        seen_follows: Set of (source, target) tuples to track duplicate follows
+    """
     interactions = []
-    if not members_data or "members_interactions" not in members_data:
+    if seen_follows is None:
+        seen_follows = set()
+    if not seed_extended_data:
+        return interactions
+
+    follow_weight = trust_weights.get("follow", 30)
+    print(f"  Processing seed_extended_followings.json with weight {follow_weight}")
+
+    users = seed_extended_data.get("users", [])
+    if not users:
+        print(f"    No users found")
+        return interactions
+
+    follow_count = 0
+    total_users = len(users)
+    for idx, user in enumerate(users):
+        if (idx + 1) % 100 == 0 or idx == 0:
+            print(f"    Processing user {idx + 1}/{total_users}...")
+
+        follower_id = normalize_user_id(user.get("user_id", ""))
+        if not follower_id:
+            continue
+
+        following_ids = user.get("following_ids", [])
+        for followed_id in following_ids:
+            followed_id_str = normalize_user_id(followed_id)
+            if followed_id_str and follower_id != followed_id_str:
+                # Check for duplicates
+                follow_pair = (follower_id, followed_id_str)
+                if follow_pair not in seen_follows:
+                    seen_follows.add(follow_pair)
+                    interactions.append(
+                        {
+                            "type": "follow",
+                            "source": follower_id,
+                            "target": followed_id_str,
+                            "weight": follow_weight,
+                        }
+                    )
+                    follow_count += 1
+
+    print(f"    Found {follow_count} unique follow relationships")
+    return interactions
+
+
+def process_seed_interactions(
+    interactions_data, trust_weights, seen_posts=None, username_to_id=None
+):
+    """Process seed user interactions to extract various interaction types
+
+    Args:
+        interactions_data: The interactions data structure
+        trust_weights: Weight configuration
+        seen_posts: Set of post_ids to track duplicate posts/replies
+        username_to_id: Mapping from username to user_id
+    """
+    interactions = []
+    if seen_posts is None:
+        seen_posts = set()
+    if username_to_id is None:
+        username_to_id = {}
+    if not interactions_data or "users" not in interactions_data:
         return interactions
 
     mention_weight = trust_weights.get("mention", 30)
@@ -147,211 +343,175 @@ def process_members_interactions(
     retweet_weight = trust_weights.get("retweet", 50)
     quote_weight = trust_weights.get("quote", 40)
 
-    print(f"  Processing member interactions")
+    print(f"  Processing seed interactions")
     print(
         f"    Weights: mention={mention_weight}, reply={reply_weight}, retweet={retweet_weight}, quote={quote_weight}"
     )
-    print(
-        f"    Community posts (community_id={community_id}) receive 2x weight multiplier"
-    )
+    print(f"    No weight multipliers applied (seed graph has no community concept)")
 
     interaction_counts = defaultdict(int)
-    community_interaction_counts = defaultdict(int)
 
-    for member in members_data["members_interactions"]:
-        member_user_id = str(member.get("user_id", ""))
-        if not member_user_id:
+    for user in interactions_data["users"]:
+        user_id = normalize_user_id(user.get("user_id", ""))
+        if not user_id:
             continue
 
-        posts = member.get("posts", [])
+        # Process posts
+        posts = user.get("posts", [])
         for post in posts:
+            post_id = post.get("post_id", "")
+
+            # Skip if we've already seen this post
+            if post_id and post_id in seen_posts:
+                continue
+            if post_id:
+                seen_posts.add(post_id)
+
             post_text = post.get("text", "")
             is_reply = post.get("is_reply", False)
-            is_retweet = post.get("is_retweet", False)
-            is_quote = post.get("is_quote", False)
-
-            # Check if post is within the community being processed
-            post_community_id = post.get("community_id")
-            is_community_post = (
-                str(post_community_id) == str(community_id)
-                if post_community_id
-                else False
-            )
-            weight_multiplier = 2.0 if is_community_post else 1.0
+            is_retweet = post.get("is_retweet")
+            is_quote = post.get("is_quote")
+            reply_to_user_id = normalize_user_id(post.get("reply_to_user_id", ""))
+            # Fallback to username lookup if reply_to_user_id not available
+            if not reply_to_user_id:
+                reply_to_username = normalize_username(
+                    post.get("reply_to_username", "")
+                )
+                reply_to_user_id = username_to_id.get(reply_to_username, "")
 
             # Process retweets
             if is_retweet:
-                original_creator_id = post.get("original_post_creator_id")
-                if original_creator_id:
-                    original_creator_id = str(original_creator_id)
-                    if original_creator_id and member_user_id != original_creator_id:
-                        interactions.append(
-                            {
-                                "type": "retweet",
-                                "source": member_user_id,
-                                "target": original_creator_id,
-                                "weight": retweet_weight * weight_multiplier,
-                            }
-                        )
-                        interaction_counts["retweet"] += 1
-                        if is_community_post:
-                            community_interaction_counts["retweet"] += 1
+                original_creator_id = normalize_user_id(
+                    post.get("original_post_creator_user_id", "")
+                )
+                # Fallback to username lookup
+                if not original_creator_id:
+                    original_creator_username = normalize_username(
+                        post.get("original_post_creator_username", "")
+                    )
+                    original_creator_id = username_to_id.get(
+                        original_creator_username, ""
+                    )
 
-            # Process quotes
-            elif is_quote:
-                original_creator_id = post.get("original_post_creator_id")
-                if original_creator_id:
-                    original_creator_id = str(original_creator_id)
-                    if original_creator_id and member_user_id != original_creator_id:
-                        interactions.append(
-                            {
-                                "type": "quote",
-                                "source": member_user_id,
-                                "target": original_creator_id,
-                                "weight": quote_weight * weight_multiplier,
-                            }
-                        )
-                        interaction_counts["quote"] += 1
-                        if is_community_post:
-                            community_interaction_counts["quote"] += 1
-
-            # Process replies
-            elif is_reply:
-                reply_to_user_id = post.get("reply_to_user_id")
-                if reply_to_user_id:
-                    reply_to_user_id = str(reply_to_user_id)
-                    if reply_to_user_id and member_user_id != reply_to_user_id:
-                        interactions.append(
-                            {
-                                "type": "reply",
-                                "source": member_user_id,
-                                "target": reply_to_user_id,
-                                "weight": reply_weight * weight_multiplier,
-                            }
-                        )
-                        interaction_counts["reply"] += 1
-                        if is_community_post:
-                            community_interaction_counts["reply"] += 1
-
-            # Process mentions in post text (need to convert username to user_id)
-            mentions = extract_mentions(post_text)
-            for mentioned_username in mentions:
-                mentioned_user_id = username_to_id.get(mentioned_username)
-                if mentioned_user_id and mentioned_user_id != member_user_id:
+                if original_creator_id and user_id != original_creator_id:
                     interactions.append(
                         {
-                            "type": "mention",
-                            "source": member_user_id,
-                            "target": mentioned_user_id,
-                            "weight": mention_weight * weight_multiplier,
+                            "type": "retweet",
+                            "source": user_id,
+                            "target": original_creator_id,
+                            "weight": retweet_weight,
                         }
                     )
-                    interaction_counts["mention"] += 1
-                    if is_community_post:
-                        community_interaction_counts["mention"] += 1
+                    interaction_counts["retweet"] += 1
 
-        # Process replies from member's replies list
-        replies = member.get("replies", [])
-        for reply in replies:
-            # Check if reply is within the community being processed
-            reply_community_id = reply.get("community_id")
-            is_reply_community_post = (
-                str(reply_community_id) == str(community_id)
-                if reply_community_id
-                else False
-            )
-            reply_weight_multiplier = 2.0 if is_reply_community_post else 1.0
+            # Process quotes (is_quote can be a dict or boolean)
+            elif is_quote:
+                original_creator_id = normalize_user_id(
+                    post.get("original_post_creator_user_id", "")
+                )
+                # Fallback to username lookup
+                if not original_creator_id:
+                    original_creator_username = normalize_username(
+                        post.get("original_post_creator_username", "")
+                    )
+                    original_creator_id = username_to_id.get(
+                        original_creator_username, ""
+                    )
 
-            reply_to_user_id = reply.get("reply_to_user_id")
-            if reply_to_user_id:
-                reply_to_user_id = str(reply_to_user_id)
-                if reply_to_user_id and member_user_id != reply_to_user_id:
+                if original_creator_id and user_id != original_creator_id:
+                    interactions.append(
+                        {
+                            "type": "quote",
+                            "source": user_id,
+                            "target": original_creator_id,
+                            "weight": quote_weight,
+                        }
+                    )
+                    interaction_counts["quote"] += 1
+
+            # Process replies
+            elif is_reply and reply_to_user_id:
+                if user_id != reply_to_user_id:
                     interactions.append(
                         {
                             "type": "reply",
-                            "source": member_user_id,
+                            "source": user_id,
                             "target": reply_to_user_id,
-                            "weight": reply_weight * reply_weight_multiplier,
+                            "weight": reply_weight,
                         }
                     )
                     interaction_counts["reply"] += 1
-                    if is_reply_community_post:
-                        community_interaction_counts["reply"] += 1
 
-            # Process mentions in reply text
-            reply_text = reply.get("text", "")
-            mentions = extract_mentions(reply_text)
+            # Process mentions in post text (lookup user_id from username)
+            mentions = extract_mentions(post_text)
             for mentioned_username in mentions:
-                mentioned_user_id = username_to_id.get(mentioned_username)
-                if mentioned_user_id and mentioned_user_id != member_user_id:
+                mentioned_user_id = username_to_id.get(mentioned_username, "")
+                if mentioned_user_id and user_id != mentioned_user_id:
                     interactions.append(
                         {
                             "type": "mention",
-                            "source": member_user_id,
+                            "source": user_id,
                             "target": mentioned_user_id,
-                            "weight": mention_weight * reply_weight_multiplier,
+                            "weight": mention_weight,
                         }
                     )
                     interaction_counts["mention"] += 1
-                    if is_reply_community_post:
-                        community_interaction_counts["mention"] += 1
 
-    for interaction_type, count in interaction_counts.items():
-        community_count = community_interaction_counts.get(interaction_type, 0)
-        print(
-            f"    Found {count} {interaction_type} interactions ({community_count} in community)"
-        )
+        # Process replies (separate from posts in seed_interactions format)
+        replies = user.get("replies", [])
+        for reply in replies:
+            reply_id = reply.get("post_id", "")
 
-    return interactions
+            # Skip if we've already seen this reply
+            if reply_id and reply_id in seen_posts:
+                continue
+            if reply_id:
+                seen_posts.add(reply_id)
 
+            reply_text = reply.get("text", "")
+            reply_to_user_id = normalize_user_id(reply.get("reply_to_user_id", ""))
+            # Fallback to username lookup
+            if not reply_to_user_id:
+                reply_to_username = normalize_username(
+                    reply.get("reply_to_username", "")
+                )
+                reply_to_user_id = username_to_id.get(reply_to_username, "")
 
-def process_comment_graph(comment_data, trust_weights):
-    """Process comment graph to extract comment interactions using user_ids"""
-    interactions = []
-    if not comment_data or "comment_graph" not in comment_data:
-        return interactions
+            if reply_to_user_id and user_id != reply_to_user_id:
+                interactions.append(
+                    {
+                        "type": "reply",
+                        "source": user_id,
+                        "target": reply_to_user_id,
+                        "weight": reply_weight,
+                    }
+                )
+                interaction_counts["reply"] += 1
 
-    reply_weight = trust_weights.get("reply", 20)  # Use reply weight for comments
-    # Comment graph interactions are always community interactions, so apply 2x multiplier
-    comment_weight = reply_weight * 2.0
-    print(
-        f"  Processing comment graph as replies with weight {reply_weight} (2x = {comment_weight} for community)"
-    )
+            # Process mentions in reply text (lookup user_id from username)
+            mentions = extract_mentions(reply_text)
+            for mentioned_username in mentions:
+                mentioned_user_id = username_to_id.get(mentioned_username, "")
+                if mentioned_user_id and user_id != mentioned_user_id:
+                    interactions.append(
+                        {
+                            "type": "mention",
+                            "source": user_id,
+                            "target": mentioned_user_id,
+                            "weight": mention_weight,
+                        }
+                    )
+                    interaction_counts["mention"] += 1
 
-    comment_count = 0
-    skipped_count = 0
+    for interaction_type, count in sorted(interaction_counts.items()):
+        print(f"    Found {count} {interaction_type} interactions")
 
-    for comment in comment_data["comment_graph"]:
-        commenter_user_id = comment.get("commenter_user_id")
-        original_author_user_id = comment.get("original_post_author_id")
-
-        if not commenter_user_id or not original_author_user_id:
-            skipped_count += 1
-            continue
-
-        commenter_user_id = str(commenter_user_id)
-        original_author_user_id = str(original_author_user_id)
-
-        if commenter_user_id != original_author_user_id:
-            interactions.append(
-                {
-                    "type": "reply",
-                    "source": commenter_user_id,
-                    "target": original_author_user_id,
-                    "weight": comment_weight,
-                }
-            )
-            comment_count += 1
-
-    print(
-        f"    Found {comment_count} reply interactions from comments, skipped {skipped_count} due to missing user_ids"
-    )
     return interactions
 
 
 def aggregate_trust_scores(all_interactions):
     """Aggregate trust scores for unique i,j pairs"""
-    trust_matrix = defaultdict(int)
+    trust_matrix = defaultdict(float)
     interaction_stats = defaultdict(int)
 
     print(f"  Aggregating {len(all_interactions)} total interactions")
@@ -375,10 +535,10 @@ def aggregate_trust_scores(all_interactions):
     return trust_matrix
 
 
-def save_trust_matrix(trust_matrix, community_id, trust_dir):
+def save_trust_matrix(trust_matrix, output_name, trust_dir):
     """Save trust matrix to CSV file with header i,j,v"""
     os.makedirs(trust_dir, exist_ok=True)
-    filename = os.path.join(trust_dir, f"{community_id}.csv")
+    filename = os.path.join(trust_dir, f"{output_name}.csv")
 
     # Sort pairs for consistent output
     sorted_pairs = sorted(trust_matrix.items(), key=lambda x: (x[0][0], x[0][1]))
@@ -408,63 +568,345 @@ def save_trust_matrix(trust_matrix, community_id, trust_dir):
         print(f"  - Min: {min_weight}")
         print(f"  - Max: {max_weight}")
         print(f"  - Average: {avg_weight:.2f}")
-        print(f"  - Total: {total_weight}")
+        print(f"  - Total: {total_weight:.2f}")
 
     return filename
 
 
-def process_community(community_id, raw_data_dir, trust_dir, trust_weights):
-    """Process a single community to generate trust scores"""
+def process_raw_data(raw_data_dir, trust_dir, trust_weights):
+    """Process raw data files in the format {seed_graph}_{range}.json and {seed_graph}_followings.json
+
+    Args:
+        raw_data_dir: Directory containing raw data files
+        trust_dir: Directory to save trust output
+        trust_weights: Weight configuration
+
+    Returns:
+        List of paths to the generated trust files, or empty list if no data found
+    """
     print(f"\n{'=' * 60}")
-    print(f"Processing community: {community_id}")
+    print(f"Processing Raw Data Files")
     print(f"{'=' * 60}")
 
-    # Define file paths
-    members_file = os.path.join(
-        raw_data_dir, f"{community_id}_members_interactions.json"
-    )
-    following_file = os.path.join(
-        raw_data_dir, f"{community_id}_following_network.json"
-    )
-    comment_file = os.path.join(raw_data_dir, f"{community_id}_comment_graph.json")
+    # Get the script directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Load all data files
-    members_data = load_json_file(members_file)
-    following_data = load_json_file(following_file)
-    comment_data = load_json_file(comment_file)
+    # Make paths absolute relative to script directory
+    if not os.path.isabs(raw_data_dir):
+        raw_data_dir = os.path.join(script_dir, raw_data_dir.lstrip("./"))
+    if not os.path.isabs(trust_dir):
+        trust_dir = os.path.join(script_dir, trust_dir.lstrip("./"))
 
-    # Check if we have at least some data
-    if not any([members_data, following_data, comment_data]):
-        print("❌ No data files found for this community")
+    # Get seed graph names from config
+    seed_graph_names = get_seed_graph_names_from_config()
+    if not seed_graph_names:
+        print("❌ No seed graph names found in config.toml [seed_graph] section")
         return None
 
-    print(f"🔄 Processing interactions...")
+    print(f"📋 Seed graph names from config: {', '.join(seed_graph_names)}")
 
-    # Build username to user_id lookup for mention processing
-    username_to_id = build_username_to_id_lookup(members_data, following_data)
-    print(f"  Built username->user_id lookup with {len(username_to_id)} entries")
+    generated_files = []
+
+    for seed_graph_name in seed_graph_names:
+        all_interactions = []
+        seen_follows = set()
+        seen_posts = set()
+        total_files_processed = 0
+        print(f"\n🔄 Processing seed graph: {seed_graph_name}")
+
+        # Look for followings file
+        followings_file = os.path.join(
+            raw_data_dir, f"{seed_graph_name}_followings.json"
+        )
+        followings_data = load_json_file(followings_file)
+
+        # Look for extended followings file
+        extended_followings_file = os.path.join(
+            raw_data_dir, f"{seed_graph_name}_extended_followings.json"
+        )
+        extended_followings_data = load_json_file(extended_followings_file)
+
+        # Look for interaction files matching pattern {seed_graph_name}_{id1}_{id2}.json
+        pattern = os.path.join(raw_data_dir, f"{seed_graph_name}_*_*.json")
+        interaction_files = [
+            f
+            for f in glob.glob(pattern)
+            if not f.endswith("_followings.json")
+            and not f.endswith("_extended_followings.json")
+        ]
+
+        if (
+            not followings_data
+            and not extended_followings_data
+            and not interaction_files
+        ):
+            print(f"  ⚠️ No data files found for {seed_graph_name}")
+            continue
+
+        # Build username to user_id mapping from followings data first
+        username_to_id = {}
+
+        if followings_data:
+            for user in followings_data.get("master_list", []):
+                username = normalize_username(user.get("username", ""))
+                user_id = normalize_user_id(user.get("user_id", ""))
+                if username and user_id:
+                    username_to_id[username] = user_id
+            for user in followings_data.get("seed_users", []):
+                username = normalize_username(user.get("username", ""))
+                user_id = normalize_user_id(user.get("user_id", ""))
+                if username and user_id:
+                    username_to_id[username] = user_id
+            total_files_processed += 1
+
+        # Add from extended followings
+        if extended_followings_data:
+            for user in extended_followings_data.get("users", []):
+                username = normalize_username(user.get("username", ""))
+                user_id = normalize_user_id(user.get("user_id", ""))
+                if username and user_id:
+                    username_to_id[username] = user_id
+
+        # Build username map from interaction files (process one at a time to save memory)
+        print(
+            f"  📁 Building username map from {len(interaction_files)} interaction files..."
+        )
+        for interaction_file in sorted(interaction_files):
+            data = load_json_file(interaction_file)
+            if data:
+                for user in data.get("users", []):
+                    username = normalize_username(user.get("username", ""))
+                    user_id = normalize_user_id(user.get("user_id", ""))
+                    if username and user_id:
+                        username_to_id[username] = user_id
+            del data  # Free memory
+
+        print(f"  📝 Built username->user_id map with {len(username_to_id)} entries")
+
+        # Free followings_data - no longer needed
+        del followings_data
+
+        # Process extended followings (with deduplication)
+        if extended_followings_data:
+            extended_following_interactions = process_seed_extended_followings(
+                extended_followings_data, trust_weights, seen_follows
+            )
+            all_interactions.extend(extended_following_interactions)
+            total_files_processed += 1
+            print(
+                f"  📥 Added {len(extended_following_interactions)} follow interactions from extended_followings"
+            )
+            del extended_following_interactions  # Free memory
+
+        # Free extended_followings_data - no longer needed
+        del extended_followings_data
+
+        # Process each interaction data file one at a time
+        print(f"  📁 Processing {len(interaction_files)} interaction files...")
+        for idx, interaction_file in enumerate(sorted(interaction_files)):
+            interactions_data = load_json_file(interaction_file)
+            if interactions_data:
+                seed_interactions = process_seed_interactions(
+                    interactions_data, trust_weights, seen_posts, username_to_id
+                )
+                all_interactions.extend(seed_interactions)
+                total_files_processed += 1
+                del seed_interactions  # Free memory
+            del interactions_data  # Free memory
+
+            if (idx + 1) % 10 == 0:
+                print(f"    Processed {idx + 1}/{len(interaction_files)} files...")
+
+        # Save username_to_id map to CSV
+        usernames_file = os.path.join(raw_data_dir, f"{seed_graph_name}_usernames.csv")
+        with open(usernames_file, "w", encoding="utf-8") as f:
+            f.write("username,user_id\n")
+            for username, user_id in sorted(username_to_id.items()):
+                f.write(f"{username},{user_id}\n")
+        print(f"  💾 Saved username map to: {usernames_file}")
+
+        # Free username_to_id - no longer needed
+        del username_to_id
+
+        print(f"\n📊 Summary for {seed_graph_name}:")
+        print(f"  Total files processed: {total_files_processed}")
+        print(f"  Total interactions collected: {len(all_interactions)}")
+        print(f"  Unique follow relationships: {len(seen_follows)}")
+        print(f"  Unique posts/replies processed: {len(seen_posts)}")
+
+        # Free deduplication sets - no longer needed
+        del seen_follows
+        del seen_posts
+
+        if not all_interactions:
+            print(f"⚠️ No interactions found for {seed_graph_name}")
+            continue
+
+        # Aggregate trust scores
+        trust_matrix = aggregate_trust_scores(all_interactions)
+
+        # Free all_interactions - no longer needed
+        del all_interactions
+
+        if not trust_matrix:
+            print(f"⚠️ No trust relationships calculated for {seed_graph_name}")
+            continue
+
+        # Save to {seed_graph_name}.csv
+        filename = save_trust_matrix(trust_matrix, seed_graph_name, trust_dir)
+        generated_files.append(filename)
+
+        # Free trust_matrix
+        del trust_matrix
+
+    return generated_files
+
+
+def process_seed_graph(raw_data_dir, trust_dir, trust_weights):
+    """Process all seed graph data files and merge into single trust graph
+
+    This function processes the old format files in raw/seed/ directory:
+    - {user_id}_seed_followings.json
+    - {user_id}_seed_interactions.json
+    - {user_id}_seed_extended_followings.json
+    """
+    print(f"\n{'=' * 60}")
+    print(f"Processing Seed Graph - Merging All Seed Files")
+    print(f"{'=' * 60}")
+
+    # Get raw_data_dir and make it relative to project root
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.join(script_dir, "..")
+
+    # Make paths absolute
+    if not os.path.isabs(raw_data_dir):
+        raw_data_dir = os.path.join(project_root, raw_data_dir.lstrip("./"))
+    if not os.path.isabs(trust_dir):
+        trust_dir = os.path.join(project_root, trust_dir.lstrip("./"))
+
+    # Get configured seed user IDs from config.toml
+    configured_user_ids = get_seed_user_ids_from_config()
+    if not configured_user_ids:
+        print("❌ No seed user IDs found in config.toml [seed_graph] section")
+        return None
+
+    print(f"📋 Configured seed user IDs: {', '.join(sorted(configured_user_ids))}")
+
+    # Find ALL seed_followings files
+    pattern = os.path.join(raw_data_dir, "*_seed_followings.json")
+    all_matching_files = glob.glob(pattern)
+
+    # Filter to only include files for users in config.toml
+    matching_files = []
+    for file_path in all_matching_files:
+        file_user_id = os.path.basename(file_path).split("_seed_followings.json")[0]
+        if file_user_id in configured_user_ids:
+            matching_files.append(file_path)
+
+    if not matching_files:
+        print(
+            f"❌ No seed followings files found for configured users in: {raw_data_dir}"
+        )
+        print(f"   Looking for user IDs: {', '.join(sorted(configured_user_ids))}")
+        print("Please run fetch_followings.py first to generate seed followings files.")
+        return None
+
+    print(
+        f"Found {len(all_matching_files)} total seed file(s), processing {len(matching_files)} for configured users"
+    )
+
+    # Collect all seed user IDs from filtered files
+    seed_user_ids = []
+    for followings_file in matching_files:
+        seed_user_id = os.path.basename(followings_file).split("_seed_followings.json")[
+            0
+        ]
+        seed_user_ids.append(seed_user_id)
+        print(f"  - Seed user ID: {seed_user_id}")
+
+    print(f"\n🔄 Processing interactions from all seed users...")
+    print(f"ℹ️  Deduplicating data across seed files...")
 
     # Process each data source
     all_interactions = []
+    all_master_usernames = set()
 
-    if following_data:
-        following_interactions = process_following_network(
-            following_data, trust_weights
+    # Global deduplication trackers
+    seen_follows = set()  # Track (source, target) pairs for follows
+    seen_posts = set()  # Track post_ids to avoid duplicate posts
+
+    # Process each seed user's data
+    for seed_user_id in seed_user_ids:
+        print(f"\n  Processing seed user: {seed_user_id}")
+
+        # Define file paths using seed_user_id prefix
+        interactions_file = os.path.join(
+            raw_data_dir, f"{seed_user_id}_seed_interactions.json"
         )
-        all_interactions.extend(following_interactions)
-
-    if members_data:
-        members_interactions = process_members_interactions(
-            members_data, trust_weights, username_to_id, community_id
+        followings_file = os.path.join(
+            raw_data_dir, f"{seed_user_id}_seed_followings.json"
         )
-        all_interactions.extend(members_interactions)
+        extended_followings_file = os.path.join(
+            raw_data_dir, f"{seed_user_id}_seed_extended_followings.json"
+        )
 
-    if comment_data:
-        comment_interactions = process_comment_graph(comment_data, trust_weights)
-        all_interactions.extend(comment_interactions)
+        # Load all data files for this seed user
+        interactions_data = load_json_file(interactions_file)
+        followings_data = load_json_file(followings_file)
+        extended_followings_data = load_json_file(extended_followings_file)
+
+        # Build username to user_id mapping from all data sources
+        username_to_id = build_username_to_id_map(
+            followings_data, extended_followings_data, interactions_data
+        )
+        print(f"    Built username->user_id map with {len(username_to_id)} entries")
+
+        # Build master_list user_ids for this seed user
+        master_user_ids = None
+        if followings_data and "master_list" in followings_data:
+            master_list = followings_data.get("master_list", [])
+            master_user_ids = {
+                normalize_user_id(user.get("user_id", ""))
+                for user in master_list
+                if user.get("user_id")
+            }
+            all_master_usernames.update(master_user_ids)
+            print(f"    Master list: {len(master_user_ids)} users")
+
+        # Process followings (with deduplication)
+        if followings_data:
+            following_interactions = process_seed_followings(
+                followings_data, trust_weights, seen_follows, username_to_id
+            )
+            all_interactions.extend(following_interactions)
+            print(f"    Added {len(following_interactions)} unique follow interactions")
+
+        # Process extended followings (with deduplication)
+        if extended_followings_data:
+            extended_following_interactions = process_seed_extended_followings(
+                extended_followings_data, trust_weights, seen_follows
+            )
+            all_interactions.extend(extended_following_interactions)
+            print(
+                f"    Added {len(extended_following_interactions)} unique extended follow interactions"
+            )
+
+        # Process interactions (with deduplication)
+        if interactions_data:
+            seed_interactions = process_seed_interactions(
+                interactions_data, trust_weights, seen_posts, username_to_id
+            )
+            all_interactions.extend(seed_interactions)
+            print(f"    Added {len(seed_interactions)} unique interaction records")
+
+    print(f"\n  Combined master list: {len(all_master_usernames)} unique user IDs")
+    print(f"  Total unique interactions collected: {len(all_interactions)}")
+    print(f"  Deduplication stats:")
+    print(f"    - Unique follow relationships: {len(seen_follows)}")
+    print(f"    - Unique posts/replies processed: {len(seen_posts)}")
 
     if not all_interactions:
-        print("⚠️  No interactions found for this community")
+        print("⚠️  No interactions found for seed graph")
         return None
 
     # Aggregate trust scores
@@ -474,15 +916,17 @@ def process_community(community_id, raw_data_dir, trust_dir, trust_weights):
         print("⚠️  No trust relationships calculated")
         return None
 
-    # Save trust matrix
-    filename = save_trust_matrix(trust_matrix, community_id, trust_dir)
+    # Always save to seed_graph.csv (merged output)
+    output_name = "seed_graph"
+
+    filename = save_trust_matrix(trust_matrix, output_name, trust_dir)
     return filename
 
 
 def main():
-    """Main function to generate trust scores"""
+    """Main function to generate trust scores for seed graph"""
     try:
-        print("🔗 TRUST SCORE GENERATOR")
+        print("🔗 SEED GRAPH TRUST SCORE GENERATOR")
         print("=" * 50)
 
         # Load configuration
@@ -491,50 +935,37 @@ def main():
             return
 
         # Get configuration values
-        community_ids = config["communities"]["ids"]
-        raw_data_dir = config["output"]["raw_data_dir"]
+        raw_data_dir = config.get("output", {}).get("raw_data_dir", "./raw")
         trust_weights = config.get("trust_weights", {})
         trust_dir = "./trust"
 
         print(f"📁 Raw data directory: {raw_data_dir}")
         print(f"📁 Trust output directory: {trust_dir}")
-        print(f"🏘️  Communities to process: {len(community_ids)}")
         print(f"⚖️  Trust weights: {trust_weights}")
 
-        # Process each community
-        processed_communities = 0
-        for i, community_id in enumerate(community_ids):
-            try:
-                filename = process_community(
-                    community_id, raw_data_dir, trust_dir, trust_weights
-                )
-                if filename:
-                    processed_communities += 1
-            except Exception as e:
-                print(f"❌ Error processing community {community_id}: {e}")
-                import traceback
+        # Try to process raw data format first (raw/{seed_graph}_{start}_{end}.json)
+        generated_files = process_raw_data(raw_data_dir, trust_dir, trust_weights)
 
-                traceback.print_exc()
+        if not generated_files:
+            print("❌ Failed to generate seed graph trust scores")
+            return
 
         # Final summary
         print(f"\n{'=' * 60}")
-        print(f"🎉 TRUST SCORE GENERATION COMPLETE")
+        print(f"🎉 SEED GRAPH TRUST SCORE GENERATION COMPLETE")
         print(f"{'=' * 60}")
-        print(
-            f"✅ Successfully processed: {processed_communities}/{len(community_ids)} communities"
-        )
+        print(f"✅ Successfully processed all seed files")
         print(f"📁 Trust files saved in: {trust_dir}/")
 
-        # List generated files
-        if os.path.exists(trust_dir):
-            csv_files = [f for f in os.listdir(trust_dir) if f.endswith(".csv")]
-            print(f"📄 Generated files:")
-            for csv_file in sorted(csv_files):
-                file_path = os.path.join(trust_dir, csv_file)
-                if os.path.exists(file_path):
-                    with open(file_path, "r") as f:
-                        line_count = sum(1 for _ in f) - 1  # Subtract header
-                    print(f"  - {csv_file} ({line_count} trust relationships)")
+        # Show generated file info
+        for filename in generated_files:
+            if os.path.exists(filename):
+                with open(filename, "r") as f:
+                    line_count = sum(1 for _ in f) - 1  # Subtract header
+                filename_base = os.path.basename(filename)
+                print(
+                    f"📄 Generated file: {filename_base} ({line_count} trust relationships)"
+                )
 
     except Exception as e:
         print(f"❌ Fatal error: {str(e)}")
